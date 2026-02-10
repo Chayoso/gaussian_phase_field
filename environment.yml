@@ -1,0 +1,47 @@
+name: crack_py11
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - cmake>=3.20
+  - cuda-toolkit=12.8
+  - h5py=3.10.0
+  - matplotlib
+  - ninja
+  - numpy=1.24.1
+  - opencv=4.8.1
+  - pillow=10.2.0
+  - pip=24.0
+  - plyfile=1.0.3
+  - pybind11>=2.11
+  - pytorch=2.5.1
+  - pyyaml
+  - scikit-learn
+  - scipy=1.12.0
+  - setuptools=68.0.0
+  - torchaudio=2.5.1
+  - torchvision=0.20.1
+  - tqdm=4.66.1
+  - vs2022_win-64
+  - pip:
+    - open3d==0.18.0
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🚀 POST-INSTALLATION STEPS
+# ═══════════════════════════════════════════════════════════════════════════
+# After creating this environment, complete the setup with:
+#
+# 1️⃣  Install PyTorch with CUDA 12.8 support:
+#     pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128    
+#
+# 2️⃣  Install FAISS for GPU-accelerated similarity search:
+#     conda install -c conda-forge faiss-gpu
+#
+#
+# 3️⃣  Install Gaussian Splatting submodules (editable mode):
+#     pip install -e gaussian-splatting/submodules/diff-gaussian-rasterization
+#     pip install -e gaussian-splatting/submodules/fused-ssim
+#     pip install -e gaussian-splatting/submodules/simple-knn

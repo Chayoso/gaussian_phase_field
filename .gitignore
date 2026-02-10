@@ -1,0 +1,33 @@
+# Output / results
+output/
+output_proper_camera.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 3DGS dependency (clone separately)
+gaussian-splatting/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Conda/venv
+.conda/
+.venv/
+venv/
+
+# Examples (empty)
+examples/

@@ -1,0 +1,142 @@
+# ============================================================================
+# MPM + Gaussian Splatting Crack Simulation Configuration
+# ============================================================================
+
+# Simulation metadata
+simulation:
+  name: "crack_simulation"
+  description: "MPM-based crack propagation with Gaussian Splatting visualization"
+  mode: "deformation"                    # "crack_only" (Fisher-KPP) | "deformation" (MPM + phase field)
+  output_dir: "output"
+  save_frames: true
+  save_checkpoint: true
+  checkpoint_interval: 100  # Save every N frames
+
+# Input mesh configuration
+mesh:
+  path: "assets/meshes/bunny.obj"  # Mesh file path (OBJ/PLY)
+  auto_generate_if_missing: true    # Generate test sphere if mesh not found
+  test_mesh_type: "sphere"          # Options: "sphere", "cube", "torus"
+  test_mesh_radius: 0.4
+
+# Particle sampling configuration
+particles:
+  target_count: 50000               # Total particles (reduced for physics speed)
+  surface_ratio: 0.4                # Surface particle ratio (0.0-1.0)
+  use_poisson_sampling: false       # Use Poisson reconstruction (experimental)
+  poisson_depth: 8                  # Octree depth for Poisson
+  normalize_to_unit_cube: true      # Normalize mesh to [0, 1]³
+
+# MPM simulation parameters
+mpm:
+  num_grids: 64                     # Grid resolution (64³ cells)
+  dt: 1.0e-4                        # Time step (CFL=0.20, safe for elasticity)
+  gravity: [0.0, 0.0, 0.0]          # No gravity (object fixed in place)
+  clip_bound: 0.05                  # Boundary distance (fraction of domain)
+  damping: 0.98                     # Velocity damping (absorbing boundary handles wave reflection)
+  particle_chunk: 8192              # Chunk size for memory efficiency
+
+# Material properties
+material:
+  constitutive_model: "corotated_phase_field"  # "phase_field" (SVK) | "corotated_phase_field"
+  center: [0.5, 0.5, 0.5]          # Material center (MPM space)
+  size: [0.8, 0.8, 0.8]            # Material extent
+  density: 1000.0                   # Material density (kg/m³)
+
+  # Elasticity parameters
+  youngs_modulus: 1.0e6            # Young's modulus (Pa)
+  poissons_ratio: 0.35             # Poisson's ratio (0.0-0.5)
+
+  # Phase field fracture parameters (AT2 model)
+  Gc: 30.0                         # Fracture toughness — background psi<threshold, crack tip psi>threshold
+  l0: 0.025                        # Regularization length (~1.5x dx = sharp crack band)
+  degradation_exponent: 3.0        # Degradation function exponent
+
+# Phase field evolution parameters
+phase_field:
+  warmup_frames: 5                  # Substeps before crack growth (stabilize H first)
+  dC_max: 0.05                     # Maximum damage increment per step (rate limiter)
+
+  # Fisher-KPP reaction-diffusion parameters (used in both crack_only and hybrid modes)
+  crack_diff_coeff: 0.0005          # Diffusion coefficient D (low → sharp wavefront)
+  crack_alpha: 100.0                # Reaction rate alpha (v=2*sqrt(D*alpha)=0.45, width~sqrt(6D/alpha)~0.005)
+  crack_grid_iters: 3               # Grid iterations per frame (more iters → faster propagation per frame)
+
+  # Nucleation parameters (seismic-only mode: no pre-existing damage seed)
+  nucleation_fraction: 0.3          # H > fraction * H_ref → nucleate damage (0.3 = 30% of critical)
+  c_nucleation: 0.01                # Initial damage value at nucleation sites
+
+# Seismic loading (earthquake ground motion)
+seismic:
+  enabled: true                     # Enable oscillating ground acceleration
+  amplitude: 500.0                  # Peak ground acceleration — moderate (only crack tip exceeds Gc)
+  frequency: 80.0                   # Oscillation frequency (Hz) — ~4 cycles in 0.05s sim time
+  direction: [1.0, 0.0, 0.0]       # Shaking direction (horizontal x-axis)
+  ramp_time: 0.005                  # Ramp-up time (seconds) to avoid initial shock
+
+# External force configuration (initial impact / crack seed)
+external_force:
+  enabled: false                    # Disabled: seismic loading handles crack initiation via nucleation
+  application_time: 0.0             # Time to apply force (seconds)
+  center: [0.5, 0.8, 0.5]          # Force center (MPM space)
+  magnitude: 5.0                    # Impact energy (normalized)
+  radius: 0.03                      # Impact radius (small point, ~2 grid cells)
+  direction: null                   # Force direction (null = radial)
+
+# Coordinate mapping (MPM ↔ World space)
+coordinate_mapping:
+  world_center: [0.5, 0.5, 0.5]    # World space origin (mesh center)
+  world_scale: 1.0                  # World space extent (1:1 with MPM)
+
+# Damage projection (Volume → Surface)
+damage_projection:
+  method: "knn_weighted"            # Options: "knn_weighted", "direct", "ray_casting"
+  k_neighbors: 8                    # Number of nearest neighbors
+  influence_radius: 0.05            # Gaussian kernel width (MPM space)
+  damage_threshold: 0.01            # Minimum damage to visualize
+  use_faiss: true                   # Use FAISS GPU acceleration
+
+# Gaussian Splatting visualization
+gaussian_splatting:
+  sh_degree: 3                      # Spherical harmonics degree (0-3, use 3 for depth version)
+
+  # Crack visualization
+  crack_color: [0.8, 0.1, 0.1]     # RGB crack color (red)
+  opacity_mode: "smooth"            # Options: "degradation", "binary", "smooth"
+  color_mode: "overlay"             # Options: "overlay", "replace", "darken"
+  scale_mode: null                  # Options: null, "widen", "shrink"
+  damage_threshold: 0.3             # Visibility threshold
+
+# Rendering configuration
+rendering:
+  image_width: 800
+  image_height: 800
+  background_color: [1.0, 1.0, 1.0]  # RGB background (white)
+
+  # Camera settings
+  camera:
+    distance: 2.0                    # Distance from origin (safe distance outside mesh)
+    elevation: 25.0                  # Elevation angle (degrees)
+    azimuth: 45.0                    # Azimuth angle (degrees)
+    fov: 50.0                        # Field of view (degrees)
+
+  # Animation settings
+  total_frames: 100                  # Total frames to simulate
+  fps: 30                            # Output video framerate
+  physics_substeps: 5                # MPM steps per render frame (reduced for speed)
+
+# Output configuration
+output:
+  video_path: "output/crack_simulation.mp4"
+  frame_dir: "output/frames"
+  statistics_log: "output/statistics.csv"
+  checkpoint_dir: "output/checkpoints"
+
+  # Logging
+  log_interval: 50                   # Print statistics every N frames
+  verbose: true
+
+# Device configuration
+device:
+  type: "cuda"                       # Options: "cuda", "cpu"
+  gpu_id: 0                          # GPU device ID (if multiple GPUs)
