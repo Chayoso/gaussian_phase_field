@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 from typing import Dict, Optional
 import time
+import math
 import sys
 import os
 
@@ -151,6 +152,89 @@ class HybridCrackSimulator:
 
         print(f"  - State initialized")
         print(f"  - Surface Gaussians: {x_surf_world.shape[0]}")
+
+    @torch.no_grad()
+    def apply_pre_notch(self, notches: list):
+        """
+        Seed initial crack from pre-defined notch lines (progressive growth).
+
+        Strategy: Create SHORT seed paths from notch center (2 paths per notch,
+        one in each direction). Seed damage along FULL notch line to weaken
+        material, but only visualize the short seed. Tips then propagate outward
+        over time, creating progressive crack growth.
+
+        Args:
+            notches: list of dicts with 'start', 'end', 'damage' keys
+        """
+        device = self.x_mpm.device
+        n = self.mpm.num_grids
+        dx = self.mpm.dx
+        crack_width = self.pf_params.get('crack_width', 0.03)
+
+        # Ensure grid is initialized
+        if not hasattr(self, 'c_grid'):
+            self._init_grid_infrastructure()
+
+        # Initialize crack paths
+        if not hasattr(self, 'crack_paths'):
+            self.crack_paths = []
+            self.crack_dirs = []
+
+        H_ref = getattr(self.elasticity, 'Gc', 30.0) / (2.0 * getattr(self.elasticity, 'l0', 0.025))
+
+        for notch in notches:
+            start = torch.tensor(notch['start'], device=device, dtype=torch.float32)
+            end = torch.tensor(notch['end'], device=device, dtype=torch.float32)
+            damage = notch.get('damage', 0.9)
+
+            center = (start + end) * 0.5
+            direction = (end - start)
+            length = direction.norm().item()
+            direction = direction / (direction.norm() + 1e-8)
+
+            # --- 1. Full notch line: sample for damage seeding ---
+            n_pts_full = max(2, int(length / dx) + 1)
+            t_full = torch.linspace(0.0, 1.0, n_pts_full, device=device)
+            full_path = start.unsqueeze(0) + t_full.unsqueeze(1) * (end - start).unsqueeze(0)
+
+            # Seed damage along FULL notch (material weakening, not visual yet)
+            min_dist = self._point_to_polyline_dist(self.x_mpm, full_path)
+            c_notch = (1.0 - (min_dist / crack_width)).clamp(0.0, 1.0) * damage
+            self.c_vol = torch.maximum(self.c_vol, c_notch)
+
+            # Seed H on PARTICLES along notch (so H_grid persists after recompute)
+            # _history_H is the per-particle energy history that H_grid is built from
+            if not hasattr(self, '_history_H'):
+                self._history_H = torch.zeros(self.x_mpm.shape[0], device=device)
+            # Particles near notch get high H (guides crack tip propagation)
+            H_seed = H_ref * 3.0
+            notch_influence = (1.0 - (min_dist / (crack_width * 2.0))).clamp(0.0, 1.0)
+            self._history_H = torch.maximum(self._history_H, notch_influence * H_seed)
+
+            # Also seed H_grid directly for frame 0
+            if hasattr(self, 'H_grid'):
+                self.H_grid = self._bin_particles_to_grid(self._history_H)
+
+            # --- 2. SHORT seed paths from center (2 paths, opposite directions) ---
+            seed_len = 3 * dx  # 3 grid cells each direction
+            n_seed = max(2, int(seed_len / dx) + 1)
+
+            # Forward path: center → toward end
+            t_fwd = torch.linspace(0.0, 1.0, n_seed, device=device)
+            path_fwd = center.unsqueeze(0) + t_fwd.unsqueeze(1) * (seed_len * direction).unsqueeze(0)
+            self.crack_paths.append(path_fwd)
+            self.crack_dirs.append(direction.clone())
+
+            # Backward path: center → toward start
+            path_bwd = center.unsqueeze(0) + t_fwd.unsqueeze(1) * (seed_len * (-direction)).unsqueeze(0)
+            self.crack_paths.append(path_bwd)
+            self.crack_dirs.append(-direction.clone())
+
+            n_damaged = (c_notch > 0.01).sum().item()
+            print(f"  [Pre-notch] {notch['start']} → {notch['end']}")
+            print(f"    center=[{center[0]:.3f},{center[1]:.3f},{center[2]:.3f}]")
+            print(f"    seed: 2 paths x {n_seed}pts, damaged particles: {n_damaged}")
+            print(f"    material weakened along full {n_pts_full}-point line")
 
     def initialize_crack_energy(
         self,
@@ -521,31 +605,171 @@ class HybridCrackSimulator:
         return grid_val.view(n, n, n)
 
     @torch.no_grad()
+    def _compute_aniso_diffusion(self) -> Tensor:
+        """
+        Compute anisotropic diffusion tensor from stress field.
+
+        Crack opens along max principal stress direction n₁.
+        Crack propagates perpendicular to n₁.
+
+        D_tensor = D_min * (n₁⊗n₁) + D_max * (I - n₁⊗n₁)
+                 = D_max * I + (D_min - D_max) * (n₁⊗n₁)
+
+        Where:
+            D_max = D_base (along crack front, same as isotropic)
+            D_min = D_base / aniso_ratio (across crack, much smaller)
+
+        Returns:
+            (n, n, n, 6) tensor: [Dxx, Dyy, Dzz, Dxy, Dxz, Dyz]
+        """
+        n = self.mpm.num_grids
+        device = self.x_mpm.device
+
+        D_base = self.pf_params.get('crack_diff_coeff', 0.0005)
+        aniso_ratio = self.pf_params.get('crack_aniso_ratio', 10.0)
+
+        D_max = D_base                  # Along crack front (propagation speed unchanged)
+        D_min = D_base / aniso_ratio    # Across crack (opening direction, much smaller)
+
+        # Default: isotropic D_base at all cells
+        D_tensor = torch.zeros(n, n, n, 6, device=device)
+        D_tensor[:, :, :, 0] = D_base  # Dxx
+        D_tensor[:, :, :, 1] = D_base  # Dyy
+        D_tensor[:, :, :, 2] = D_base  # Dzz
+        # Off-diagonal = 0
+
+        if not hasattr(self, '_last_stress'):
+            return D_tensor
+
+        # --- 1) Bin 6 stress tensor components to grid ---
+        stress = self._last_stress  # (N, 3, 3)
+        components = [
+            (0, 0), (1, 1), (2, 2),  # diagonal
+            (0, 1), (0, 2), (1, 2),  # upper triangle
+        ]
+        S_comps = []
+        for (i, j) in components:
+            S_comps.append(self._bin_particles_to_grid(stress[:, i, j]))
+        # S_comps: list of 6 (n,n,n) tensors
+
+        # --- 2) Reconstruct symmetric 3x3 at occupied cells ---
+        occ = self.grid_occupied
+        occ_idx = occ.nonzero()  # (M, 3)
+        M = occ_idx.shape[0]
+        if M == 0:
+            return D_tensor
+
+        S_occ = torch.zeros(M, 3, 3, device=device)
+        for k, (i, j) in enumerate(components):
+            vals = S_comps[k][occ_idx[:, 0], occ_idx[:, 1], occ_idx[:, 2]]
+            S_occ[:, i, j] = vals
+            if i != j:
+                S_occ[:, j, i] = vals
+
+        # --- 3) Filter cells with significant stress, sanitize ---
+        S_occ = torch.nan_to_num(S_occ, 0.0, 0.0, 0.0)
+        S_norm = S_occ.norm(dim=(1, 2))
+        sig_mask = (S_norm > 1e-3) & torch.isfinite(S_norm)
+        if sig_mask.sum() == 0:
+            return D_tensor
+
+        sig_idx = occ_idx[sig_mask]  # (K, 3)
+        S_sig = S_occ[sig_mask]      # (K, 3, 3)
+
+        # Ensure perfect symmetry (avoid cusolver errors)
+        S_sig = 0.5 * (S_sig + S_sig.transpose(1, 2))
+
+        # --- 4) Eigendecomposition → max principal direction ---
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(S_sig)  # sorted ascending
+        except Exception:
+            return D_tensor
+        # Max principal stress = last eigenvalue, direction = last eigenvector
+        n1 = eigenvectors[:, :, -1]  # (K, 3) max principal direction
+
+        # --- 4b) Store n1 on full grid for directional reaction modulation ---
+        if not hasattr(self, '_n1_grid'):
+            self._n1_grid = torch.zeros(n, n, n, 3, device=device)
+        self._n1_grid.zero_()
+        self._n1_grid[sig_idx[:, 0], sig_idx[:, 1], sig_idx[:, 2]] = n1
+
+        # --- 5) Build D_tensor at these cells ---
+        # D = D_max * I + (D_min - D_max) * (n₁⊗n₁)
+        dD = D_min - D_max  # negative: reduces D along n₁
+
+        ix = sig_idx[:, 0]
+        iy = sig_idx[:, 1]
+        iz = sig_idx[:, 2]
+
+        D_tensor[ix, iy, iz, 0] = D_max + dD * n1[:, 0] ** 2  # Dxx
+        D_tensor[ix, iy, iz, 1] = D_max + dD * n1[:, 1] ** 2  # Dyy
+        D_tensor[ix, iy, iz, 2] = D_max + dD * n1[:, 2] ** 2  # Dzz
+        D_tensor[ix, iy, iz, 3] = dD * n1[:, 0] * n1[:, 1]    # Dxy
+        D_tensor[ix, iy, iz, 4] = dD * n1[:, 0] * n1[:, 2]    # Dxz
+        D_tensor[ix, iy, iz, 5] = dD * n1[:, 1] * n1[:, 2]    # Dyz
+
+        return D_tensor
+
+    @torch.no_grad()
+    def _anisotropic_laplacian(self, c: Tensor, D_tensor: Tensor) -> Tensor:
+        """
+        Compute anisotropic Laplacian: L = Σ_ij D_ij * ∂²c/∂xi∂xj
+
+        Uses central finite differences for all 6 second derivatives.
+        Cross terms: ∂²c/∂xi∂xj = (c[+i,+j] - c[+i,-j] - c[-i,+j] + c[-i,-j]) / (4 dx²)
+
+        Args:
+            c: (n, n, n) scalar field
+            D_tensor: (n, n, n, 6) [Dxx, Dyy, Dzz, Dxy, Dxz, Dyz]
+
+        Returns:
+            (n, n, n) anisotropic Laplacian
+        """
+        dx = self.mpm.dx
+        dx2 = dx * dx
+
+        # Pad for boundary
+        g5 = c.unsqueeze(0).unsqueeze(0)
+        gp = torch.nn.functional.pad(g5, (1, 1, 1, 1, 1, 1), mode='replicate')[0, 0]
+
+        # Direct second derivatives (diagonal of Hessian)
+        c_xx = (gp[2:, 1:-1, 1:-1] - 2 * c + gp[:-2, 1:-1, 1:-1]) / dx2
+        c_yy = (gp[1:-1, 2:, 1:-1] - 2 * c + gp[1:-1, :-2, 1:-1]) / dx2
+        c_zz = (gp[1:-1, 1:-1, 2:] - 2 * c + gp[1:-1, 1:-1, :-2]) / dx2
+
+        # Cross second derivatives (off-diagonal of Hessian)
+        c_xy = (gp[2:, 2:, 1:-1] - gp[2:, :-2, 1:-1]
+                - gp[:-2, 2:, 1:-1] + gp[:-2, :-2, 1:-1]) / (4 * dx2)
+        c_xz = (gp[2:, 1:-1, 2:] - gp[2:, 1:-1, :-2]
+                - gp[:-2, 1:-1, 2:] + gp[:-2, 1:-1, :-2]) / (4 * dx2)
+        c_yz = (gp[1:-1, 2:, 2:] - gp[1:-1, 2:, :-2]
+                - gp[1:-1, :-2, 2:] + gp[1:-1, :-2, :-2]) / (4 * dx2)
+
+        # L = Dxx*c_xx + Dyy*c_yy + Dzz*c_zz + 2*Dxy*c_xy + 2*Dxz*c_xz + 2*Dyz*c_yz
+        L = (D_tensor[:, :, :, 0] * c_xx +
+             D_tensor[:, :, :, 1] * c_yy +
+             D_tensor[:, :, :, 2] * c_zz +
+             2.0 * D_tensor[:, :, :, 3] * c_xy +
+             2.0 * D_tensor[:, :, :, 4] * c_xz +
+             2.0 * D_tensor[:, :, :, 5] * c_yz)
+
+        return L
+
+    @torch.no_grad()
     def step_hybrid_crack(self, dt: float):
         """
-        Hybrid crack propagation: grid-based Fisher-KPP with H-modulated reaction rate.
+        Hybrid crack propagation: anisotropic Fisher-KPP with stress-directed diffusion.
 
-        The key insight: AT2's Laplacian term (l0²∇²c) is too weak on uniform MPM grids.
-        Instead, we use Fisher-KPP's reaction term c(1-c) for propagation, with the
-        reaction rate alpha modulated by the physics-computed stress history H.
-
-        This gives us:
-        - Sharp wavefront (controlled by D/alpha ratio)
-        - Physics-directed propagation (H higher at stress concentrations)
-        - Decoupled from AT2's l0 limitation
-
-        Algorithm:
-        1. Bin particle _history_H to H_grid (weighted average)
-        2. Compute spatially varying alpha: alpha(x) = alpha_base * clamp(H/H_ref, 0, 1)
-        3. Run Fisher-KPP: dc/dt = D*∇²c + alpha(x)*c*(1-c)
-        4. Gather grid damage back to particles
-        5. Irreversibility: c can only increase
+        Key improvements over isotropic version:
+        1. Anisotropic diffusion: D small along max principal stress (crack opening),
+           D large perpendicular (crack propagation) → thin crack lines, not blobs
+        2. Top-K nucleation: only seed at the K highest-H cells per frame → cleaner paths
+        3. H-modulated reaction rate: alpha(x) ∝ H/H_ref → physics-directed
 
         Args:
             dt: Physics timestep (not directly used; Fisher-KPP has its own dt)
         """
         if not hasattr(self, 'c_grid'):
-            # Auto-initialize grid infrastructure (seismic-only mode, no impact seed)
             self._init_grid_infrastructure()
 
         if not hasattr(self, '_hybrid_step'):
@@ -555,16 +779,23 @@ class HybridCrackSimulator:
         dx = self.mpm.dx
         device = self.x_mpm.device
 
+        step = self._hybrid_step
+
         # --- Parameters ---
-        D = self.pf_params.get('crack_diff_coeff', 0.0005)     # Low D → sharp front
-        alpha_base = self.pf_params.get('crack_alpha', 100.0)   # High alpha → fast propagation
-        n_iters = self.pf_params.get('crack_grid_iters', 1)
         Gc = getattr(self.elasticity, 'Gc', 30.0)
         l0 = getattr(self.elasticity, 'l0', 0.025)
-
-        # H_ref: threshold above which full propagation speed is allowed
-        # H_ref = Gc / (2*l0) is the AT2 critical driving force
         H_ref = Gc / (2.0 * l0)
+        max_nuc = self.pf_params.get('max_nucleation_per_frame', 1)
+        nucleation_frac = self.pf_params.get('nucleation_fraction', 0.3)
+        min_spacing = self.pf_params.get('nucleation_min_spacing', 8)
+        crack_tip_speed = self.pf_params.get('crack_tip_speed', 1.5)
+        crack_width = self.pf_params.get('crack_width', 0.025)
+        max_total_cracks = self.pf_params.get('max_total_cracks', 5)
+
+        # Initialize crack paths and smoothed directions
+        if not hasattr(self, 'crack_paths'):
+            self.crack_paths = []
+            self.crack_dirs = []  # smoothed propagation direction per path
 
         # --- 1) Bin particle H to grid ---
         if hasattr(self, '_history_H'):
@@ -572,77 +803,354 @@ class HybridCrackSimulator:
         else:
             self.H_grid = torch.zeros(n, n, n, device=device)
 
-        # --- 2) Compute spatially varying reaction rate ---
-        # alpha(x) = alpha_base * clamp(H_grid / H_ref, 0, alpha_max_ratio)
-        # Where H > H_ref → full speed, H = 0 → no propagation
-        # This ensures crack only grows where stress has been high enough
-        H_ratio = (self.H_grid / (H_ref + 1e-12)).clamp(0.0, 2.0)
-        alpha_grid = alpha_base * H_ratio  # (n, n, n)
+        # --- 2) Compute stress eigenvectors for propagation direction ---
+        if hasattr(self, '_last_stress') and self._last_stress is not None:
+            self._compute_aniso_diffusion()  # computes self._n1_grid
 
-        # --- 2b) Nucleation: seed damage where stress exceeds threshold ---
-        # Without this, c=0 → reaction=0, crack never starts.
-        # When H > nucleation_fraction * H_ref, nucleate c = c_nucleation.
-        nucleation_frac = self.pf_params.get('nucleation_fraction', 0.5)
-        c_nucleation = self.pf_params.get('c_nucleation', 0.01)
-        nucleation_mask = (self.H_grid > nucleation_frac * H_ref) & (self.c_grid < c_nucleation)
-        nucleation_mask = nucleation_mask & self.grid_occupied
-        self.c_grid[nucleation_mask] = c_nucleation
+        # --- 3) Nucleation: create new crack tips at highest-H cells ---
+        n_new = 0
+        if len(self.crack_paths) < max_total_cracks:
+            # Build exclusion zone around existing crack paths
+            crack_mask = torch.zeros(n, n, n, device=device, dtype=torch.bool)
+            for path in self.crack_paths:
+                for pt in path:
+                    gi = (pt * n).long().clamp(0, n - 1)
+                    lo = (gi - min_spacing).clamp(min=0)
+                    hi = (gi + min_spacing + 1).clamp(max=n)
+                    crack_mask[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]] = True
 
-        # --- 3) Fisher-KPP iterations on grid ---
-        # Stability limit: dt < dx² / (6D)
-        dt_rd = 0.8 * dx * dx / (6.0 * D + 1e-12)
-        dt_rd = min(dt_rd, 0.01)
+            # Interior mask: require all 6 face-neighbors to be occupied
+            # This prevents nucleation at thin extremities (ears, nose, feet)
+            occ = self.grid_occupied
+            interior = (occ[1:-1, 1:-1, 1:-1] &
+                        occ[2:, 1:-1, 1:-1] & occ[:-2, 1:-1, 1:-1] &
+                        occ[1:-1, 2:, 1:-1] & occ[1:-1, :-2, 1:-1] &
+                        occ[1:-1, 1:-1, 2:] & occ[1:-1, 1:-1, :-2])
+            interior_full = torch.zeros_like(occ)
+            interior_full[1:-1, 1:-1, 1:-1] = interior
 
-        occ_float = self.grid_occupied.float()
+            candidate_mask = ((self.H_grid > nucleation_frac * H_ref) &
+                              interior_full & ~crack_mask)
+            n_candidates = candidate_mask.sum().item()
 
-        for _ in range(n_iters):
-            # 3D Laplacian with replicate boundary
-            g5 = self.c_grid.unsqueeze(0).unsqueeze(0)
-            gp = torch.nn.functional.pad(g5, (1, 1, 1, 1, 1, 1), mode='replicate')[0, 0]
-            lap = (
-                gp[2:, 1:-1, 1:-1] + gp[:-2, 1:-1, 1:-1] +
-                gp[1:-1, 2:, 1:-1] + gp[1:-1, :-2, 1:-1] +
-                gp[1:-1, 1:-1, 2:] + gp[1:-1, 1:-1, :-2] - 6.0 * self.c_grid
-            ) / (dx * dx)
+            if n_candidates > 0 and max_nuc > 0:
+                H_score = self.H_grid.clone()
+                H_score[~candidate_mask] = 0.0
+                K = min(max_nuc, n_candidates)
+                _, topk_flat = H_score.view(-1).topk(K)
 
-            # Fisher-KPP with spatially varying alpha
-            reaction = alpha_grid * self.c_grid * (1.0 - self.c_grid)
-            self.c_grid = self.c_grid + dt_rd * (D * lap + reaction)
-            self.c_grid = self.c_grid.clamp(0.0, 1.0)
+                for flat_idx in topk_flat:
+                    fi = flat_idx.item()
+                    i0 = fi // (n * n)       # dim 0
+                    i1 = (fi % (n * n)) // n  # dim 1
+                    i2 = fi % n               # dim 2
+                    pos = torch.tensor(
+                        [(i0 + 0.5) / n, (i1 + 0.5) / n, (i2 + 0.5) / n],
+                        device=device, dtype=torch.float32
+                    )
+                    self.crack_paths.append(pos.unsqueeze(0))  # (1, 3)
+                    self.crack_dirs.append(None)  # no direction yet
+                    n_new += 1
+                    if self._hybrid_step < 50:
+                        print(f"  [NUC] New crack at grid=({i0},{i1},{i2}) "
+                              f"pos=[{pos[0]:.3f},{pos[1]:.3f},{pos[2]:.3f}] "
+                              f"H={self.H_grid[i0,i1,i2]:.1f}", flush=True)
 
-            # Constrain to object volume
-            self.c_grid = self.c_grid * occ_float
+        # --- 4) Advance crack tips (with EMA direction smoothing) ---
+        ema_alpha = 0.3  # EMA weight for new direction (lower = smoother)
+        min_step_dist = 0.3 * dx  # skip if tip barely moved (anti-jitter)
 
-        # --- 4) Gather grid damage to particles ---
+        # Branching parameters
+        branch_angle = self.pf_params.get('branch_angle', 35.0)
+        branch_min_len = self.pf_params.get('branch_min_length', 6)
+        branch_prob = self.pf_params.get('branch_probability', 0.3)
+        max_branches = self.pf_params.get('max_branches_per_path', 1)
+        if not hasattr(self, '_branch_count'):
+            self._branch_count = {}  # path_idx → number of times branched
+
+        pending_branches = []  # (tip_pos, dir1, dir2) to add after loop
+
+        for path_idx in range(len(self.crack_paths)):
+            path = self.crack_paths[path_idx]
+            tip = path[-1]  # (3,)
+
+            # Grid index of tip
+            gi = (tip * n).long().clamp(1, n - 2)
+            i, j, k = gi[0].item(), gi[1].item(), gi[2].item()
+
+            H_local = self.H_grid[i, j, k].item()
+
+            # Compute ∇H at tip (central differences)
+            grad_H = torch.zeros(3, device=device)
+            grad_H[0] = (self.H_grid[min(i+1, n-1), j, k] - self.H_grid[max(i-1, 0), j, k]) / (2 * dx)
+            grad_H[1] = (self.H_grid[i, min(j+1, n-1), k] - self.H_grid[i, max(j-1, 0), k]) / (2 * dx)
+            grad_H[2] = (self.H_grid[i, j, min(k+1, n-1)] - self.H_grid[i, j, max(k-1, 0)]) / (2 * dx)
+
+            # Project ∇H perpendicular to n1 (crack opening direction)
+            raw_dir = grad_H
+            if hasattr(self, '_n1_grid') and self._n1_grid is not None:
+                n1 = self._n1_grid[i, j, k]  # (3,)
+                n1_mag = n1.norm()
+                if n1_mag > 1e-6:
+                    n1 = n1 / n1_mag
+                    raw_dir = grad_H - (grad_H * n1).sum() * n1
+
+            raw_mag = raw_dir.norm()
+            if raw_mag > 1e-8:
+                raw_dir = raw_dir / raw_mag
+            else:
+                # Fallback: continue in previous smoothed direction
+                if self.crack_dirs[path_idx] is not None:
+                    raw_dir = self.crack_dirs[path_idx]
+                elif path.shape[0] >= 2:
+                    raw_dir = path[-1] - path[-2]
+                    raw_mag = raw_dir.norm()
+                    if raw_mag < 1e-8:
+                        continue
+                    raw_dir = raw_dir / raw_mag
+                else:
+                    continue
+
+            # EMA smoothing of propagation direction
+            if self.crack_dirs[path_idx] is None:
+                smooth_dir = raw_dir
+            else:
+                smooth_dir = (1.0 - ema_alpha) * self.crack_dirs[path_idx] + ema_alpha * raw_dir
+                sm = smooth_dir.norm()
+                if sm < 1e-8:
+                    smooth_dir = raw_dir
+                else:
+                    smooth_dir = smooth_dir / sm
+            self.crack_dirs[path_idx] = smooth_dir
+
+            # Constant speed once nucleated
+            speed = crack_tip_speed * dx
+            new_tip = (tip + speed * smooth_dir).clamp(dx, 1.0 - dx)
+
+            # Constrain tip to stay inside occupied grid cells
+            ngi = (new_tip * n).long().clamp(0, n - 1)
+            if not self.grid_occupied[ngi[0], ngi[1], ngi[2]]:
+                # Try 26 neighbors to find an occupied cell nearby
+                found = False
+                best_tip = None
+                best_dot = -1.0
+                for di in [-1, 0, 1]:
+                    for dj in [-1, 0, 1]:
+                        for dk in [-1, 0, 1]:
+                            if di == 0 and dj == 0 and dk == 0:
+                                continue
+                            alt_dir = torch.tensor(
+                                [float(di), float(dj), float(dk)], device=device
+                            )
+                            alt_dir = alt_dir / alt_dir.norm()
+                            alt_tip = (tip + speed * alt_dir).clamp(dx, 1.0 - dx)
+                            agi = (alt_tip * n).long().clamp(0, n - 1)
+                            if self.grid_occupied[agi[0], agi[1], agi[2]]:
+                                dot = (alt_dir * smooth_dir).sum()
+                                if dot > best_dot:
+                                    best_dot = dot
+                                    best_tip = alt_tip
+                                    found = True
+                if found:
+                    new_tip = best_tip
+                    self.crack_dirs[path_idx] = ((new_tip - tip) /
+                                                  ((new_tip - tip).norm() + 1e-8))
+                else:
+                    continue  # completely stuck, skip
+
+            # Anti-jitter: only extend path if tip actually moved significantly
+            if (new_tip - tip).norm() > min_step_dist:
+                self.crack_paths[path_idx] = torch.cat([path, new_tip.unsqueeze(0)], dim=0)
+
+            # --- Branching check ---
+            n_branches_so_far = self._branch_count.get(path_idx, 0)
+            path_len = self.crack_paths[path_idx].shape[0]
+            can_branch = (path_len >= branch_min_len and
+                          n_branches_so_far < max_branches and
+                          len(self.crack_paths) + len(pending_branches) * 2 < max_total_cracks and
+                          H_local > 0.3 * H_ref)
+            if can_branch and torch.rand(1).item() < branch_prob:
+                parent_dir = self.crack_dirs[path_idx]
+                if parent_dir is not None:
+                    dir1 = self._rotate_direction(parent_dir, branch_angle)
+                    dir2 = self._rotate_direction(parent_dir, -branch_angle)
+                    pending_branches.append((new_tip.clone(), dir1, dir2))
+                    self._branch_count[path_idx] = n_branches_so_far + 1
+
+        # Add branched paths
+        for tip_pos, dir1, dir2 in pending_branches:
+            idx1 = len(self.crack_paths)
+            self.crack_paths.append(tip_pos.unsqueeze(0))
+            self.crack_dirs.append(dir1)
+            idx2 = len(self.crack_paths)
+            self.crack_paths.append(tip_pos.unsqueeze(0))
+            self.crack_dirs.append(dir2)
+            if step < 50:
+                print(f"  [BRANCH] New fork at [{tip_pos[0]:.3f},{tip_pos[1]:.3f},{tip_pos[2]:.3f}] "
+                      f"angle=±{branch_angle}°", flush=True)
+
+        # --- 5) Assign damage from crack paths to particles ---
         c_old = self.c_vol.clone()
-        self._gather_grid_to_particles()
-
-        # --- 5) Irreversibility: damage only increases ---
-        self.c_vol = torch.maximum(self.c_vol, c_old)
+        self._assign_crack_damage(crack_width)
 
         # --- 6) Diagnostics ---
-        step = self._hybrid_step
-        if step < 30 or step % 10 == 0:
+        if step < 5 or step % 20 == 0:
+            n_paths = len(self.crack_paths)
+            total_pts = sum(p.shape[0] for p in self.crack_paths)
+            max_len = max((p.shape[0] for p in self.crack_paths), default=0)
+            n_cracked = (self.c_vol > 0.3).sum().item()
             dc = self.c_vol - c_old
-            n_growing = (dc > 1e-6).sum().item()
-            n_01 = (self.c_vol > 0.01).sum().item()
-            n_30 = (self.c_vol > 0.3).sum().item()
-            n_80 = (self.c_vol > 0.8).sum().item()
-            gc_max = self.c_grid.max().item()
-            gc_cells_30 = (self.c_grid > 0.3).sum().item()
-            H_max = self.H_grid.max().item()
-            H_active = (H_ratio > 0.1).sum().item()
-            alpha_max = alpha_grid.max().item()
-            print(f"  [hybrid {step:3d}] c_max={self.c_vol.max():.4f} "
-                  f"gc_max={gc_max:.4f} gc_cells(>0.3)={gc_cells_30} "
-                  f"dc_max={dc.max():.6f} growing={n_growing} "
-                  f"H_max={H_max:.2e} H_ref={H_ref:.2e} "
-                  f"H_active(>0.1)={H_active} "
-                  f"alpha_max={alpha_max:.1f} "
-                  f"cracked(>0.01/{n_01} >0.3/{n_30} >0.8/{n_80})",
+            print(f"  [crack-tip {step:3d}] paths={n_paths} pts={total_pts} "
+                  f"max_seg={max_len} c_max={self.c_vol.max():.4f} "
+                  f"cracked(>0.3)={n_cracked} dc_max={dc.max():.6f} "
+                  f"H_max={self.H_grid.max():.2e} H_ref={H_ref:.2e} "
+                  f"nuc_new={n_new}",
                   flush=True)
 
         self._hybrid_step += 1
+
+    @torch.no_grad()
+    def _assign_crack_damage(self, crack_width: float = 0.025):
+        """Assign damage to particles based on proximity to crack paths."""
+        if not self.crack_paths:
+            return
+
+        positions = self.x_mpm  # (N, 3)
+        min_dist = torch.full((positions.shape[0],), float('inf'), device=positions.device)
+
+        for path in self.crack_paths:
+            if path.shape[0] == 1:
+                dist = (positions - path[0]).norm(dim=1)
+            else:
+                dist = self._point_to_polyline_dist(positions, path)
+            min_dist = torch.minimum(min_dist, dist)
+
+        # Smooth damage profile: 1 at crack center, 0 at crack_width
+        c_new = (1.0 - (min_dist / crack_width)).clamp(0.0, 1.0)
+        self.c_vol = torch.maximum(self.c_vol, c_new)
+
+    @torch.no_grad()
+    def _point_to_polyline_dist(self, points: torch.Tensor, polyline: torch.Tensor) -> torch.Tensor:
+        """Compute minimum distance from each point to any segment of a polyline."""
+        N = points.shape[0]
+        M = polyline.shape[0]
+
+        if M < 2:
+            return (points - polyline[0]).norm(dim=1)
+
+        min_dist = torch.full((N,), float('inf'), device=points.device)
+
+        a = polyline[:-1]    # (M-1, 3) segment starts
+        b = polyline[1:]     # (M-1, 3) segment ends
+        ab = b - a           # (M-1, 3)
+        ab_len = ab.norm(dim=1)  # (M-1,)
+        valid = ab_len > 1e-10
+
+        if not valid.any():
+            return (points - polyline[0]).norm(dim=1)
+
+        a_v = a[valid]
+        ab_v = ab[valid]
+        ab_len_v = ab_len[valid]
+        ab_norm_v = ab_v / ab_len_v.unsqueeze(1)
+
+        for seg_idx in range(a_v.shape[0]):
+            ap = points - a_v[seg_idx]                           # (N, 3)
+            t = (ap * ab_norm_v[seg_idx]).sum(dim=1)             # (N,)
+            t = t.clamp(0.0, ab_len_v[seg_idx].item())
+            closest = a_v[seg_idx] + t.unsqueeze(1) * ab_norm_v[seg_idx]  # (N, 3)
+            dist = (points - closest).norm(dim=1)
+            min_dist = torch.minimum(min_dist, dist)
+
+        return min_dist
+
+    @torch.no_grad()
+    def _rotate_direction(self, direction: Tensor, angle_deg: float) -> Tensor:
+        """
+        Rotate a 3D direction vector by angle_deg around a perpendicular axis.
+        Uses Rodrigues' rotation formula.
+        """
+        device = direction.device
+        # Find a perpendicular axis
+        if abs(direction[1].item()) < 0.9:
+            up = torch.tensor([0.0, 1.0, 0.0], device=device)
+        else:
+            up = torch.tensor([1.0, 0.0, 0.0], device=device)
+        axis = torch.linalg.cross(direction, up)
+        axis = axis / (axis.norm() + 1e-8)
+
+        angle = angle_deg * math.pi / 180.0
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        # Rodrigues: v' = v*cos + (k x v)*sin + k*(k.v)*(1-cos)
+        rotated = (direction * cos_a +
+                   torch.linalg.cross(axis, direction) * sin_a +
+                   axis * (axis @ direction) * (1.0 - cos_a))
+        return rotated / (rotated.norm() + 1e-8)
+
+    @torch.no_grad()
+    def _project_paths_to_surface(
+        self, crack_paths: list, x_surf_world: Tensor
+    ) -> list:
+        """
+        Project interior crack paths onto the nearest surface Gaussian positions.
+
+        Uses INITIAL (undeformed) surface positions for stable mapping, then
+        returns CURRENT positions of those same Gaussians. This prevents crack
+        lines from wobbling/jumping between Gaussians during seismic shaking.
+
+        Args:
+            crack_paths: list of (M_i, 3) tensors in MPM space
+            x_surf_world: (N_surf, 3) CURRENT surface Gaussian positions in world space
+
+        Returns:
+            list of (M_i, 3) projected paths in world space (current positions)
+        """
+        # Cache initial surface positions for stable projection
+        if not hasattr(self, '_init_surf_world'):
+            self._init_surf_world = x_surf_world.clone()
+
+        # Cache per-path projection indices (only recompute when path grows)
+        if not hasattr(self, '_proj_cache'):
+            self._proj_cache = {}  # path_id → (prev_len, gaussian_indices, unique_mask)
+
+        projected = []
+        for path_idx, path in enumerate(crack_paths):
+            if path.shape[0] < 2:
+                continue
+
+            path_world = self.mapper.mpm_to_world(path)  # (M, 3)
+            M = path_world.shape[0]
+
+            # Check cache: reuse if path hasn't grown
+            cache = self._proj_cache.get(path_idx)
+            if cache is not None and cache[0] == M:
+                gauss_idx, unique_mask = cache[1], cache[2]
+            else:
+                # Project against INITIAL (stable) surface positions
+                gauss_idx = torch.zeros(M, dtype=torch.long, device=path_world.device)
+                chunk = 64
+                for i in range(0, M, chunk):
+                    j = min(i + chunk, M)
+                    dists = torch.cdist(path_world[i:j], self._init_surf_world)
+                    gauss_idx[i:j] = dists.argmin(dim=1)
+
+                # Build unique mask (remove consecutive duplicates)
+                unique_mask = torch.ones(M, dtype=torch.bool, device=path_world.device)
+                for i in range(1, M):
+                    if gauss_idx[i] == gauss_idx[i - 1]:
+                        unique_mask[i] = False
+
+                self._proj_cache[path_idx] = (M, gauss_idx, unique_mask)
+
+            # Use CURRENT positions of the mapped Gaussians
+            nearest_pts = x_surf_world[gauss_idx]
+            proj_path = nearest_pts[unique_mask]
+
+            if proj_path.shape[0] >= 2:
+                projected.append(proj_path)
+
+        return projected if projected else None
 
     @torch.no_grad()
     def step_physics(self, dt: float):
@@ -671,6 +1179,9 @@ class HybridCrackSimulator:
         # Safety: clamp stress to physical range (E=1e6, max ~5x E)
         stress_limit = 5e6
         stress = stress.clamp(-stress_limit, stress_limit)
+
+        # Store stress tensor for anisotropic crack diffusion
+        self._last_stress = stress.detach()
 
         # 2. MPM particle-grid-particle transfer
         x_old = self.x_mpm.clone()
@@ -754,9 +1265,20 @@ class HybridCrackSimulator:
         x_surf_world = self.mapper.mpm_to_world(x_surf_mpm)
 
         # Update Gaussian Splat properties
+        # Project crack paths onto surface for accurate visualization
+        crack_paths_surface = None
+        if hasattr(self, 'crack_paths') and self.crack_paths:
+            crack_paths_surface = self._project_paths_to_surface(
+                self.crack_paths, x_surf_world
+            )
+        crack_width = self.mapper.scale_mpm_to_world(
+            self.pf_params.get('crack_width', 0.03)
+        )
         self.visualizer.update_gaussians(
             self.gaussians, c_surf, x_surf_world,
-            preserve_original=True
+            preserve_original=True,
+            crack_paths=crack_paths_surface,
+            crack_width=crack_width
         )
 
         self.frame_count += 1

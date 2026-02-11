@@ -446,7 +446,14 @@ def setup_simulator(
         opacity_mode=config.gaussian_splatting.opacity_mode,
         color_mode=config.gaussian_splatting.color_mode,
         scale_mode=config.gaussian_splatting.scale_mode,
-        damage_threshold=config.gaussian_splatting.damage_threshold,
+        damage_threshold=config.gaussian_splatting.get("damage_threshold", 0.2),
+        sharp_k=config.gaussian_splatting.get("sharp_k", 30.0),
+        edge_width=config.gaussian_splatting.get("edge_width", 0.12),
+        crack_opacity_reduction=config.gaussian_splatting.get("crack_opacity_reduction", 0.85),
+        max_opening=config.gaussian_splatting.get("crack_max_opening", 0.015),
+        gap_fraction=config.gaussian_splatting.get("crack_gap_fraction", 0.3),
+        edge_darken=config.gaussian_splatting.get("crack_edge_darken", 0.3),
+        red_accent=config.gaussian_splatting.get("crack_red_accent", 0.15),
         device=device
     )
 
@@ -454,13 +461,16 @@ def setup_simulator(
     phase_field_params = {
         "warmup_frames": config.phase_field.get("warmup_frames", 5),
         "dC_max": config.phase_field.get("dC_max", 0.02),
-        # Fisher-KPP reaction-diffusion parameters
-        "crack_diff_coeff": config.phase_field.get("crack_diff_coeff", 0.0005),
-        "crack_alpha": config.phase_field.get("crack_alpha", 100.0),
-        "crack_grid_iters": config.phase_field.get("crack_grid_iters", 3),
-        # Nucleation parameters (seismic-only mode)
+        # Crack-tip tracking parameters
+        "crack_tip_speed": config.phase_field.get("crack_tip_speed", 1.5),
+        "crack_width": config.phase_field.get("crack_width", 0.025),
+        "max_total_cracks": config.phase_field.get("max_total_cracks", 5),
+        # Anisotropic diffusion (for stress eigenvector computation)
+        "crack_aniso_ratio": config.phase_field.get("crack_aniso_ratio", 200.0),
+        # Nucleation parameters
         "nucleation_fraction": config.phase_field.get("nucleation_fraction", 0.3),
-        "c_nucleation": config.phase_field.get("c_nucleation", 0.01),
+        "max_nucleation_per_frame": config.phase_field.get("max_nucleation_per_frame", 1),
+        "nucleation_min_spacing": config.phase_field.get("nucleation_min_spacing", 8),
     }
 
     # Seismic loading parameters (earthquake ground motion)
@@ -694,6 +704,20 @@ def run_simulation(config: OmegaConf, simulator, camera, args):
                 )
         else:
             print(f"  - WARNING: No visible Gaussians found! Skipping impact.")
+
+    # Apply pre-notch if configured
+    if hasattr(config, 'pre_notch') and config.pre_notch.get('enabled', False):
+        notches = config.pre_notch.get('notches', [])
+        if notches:
+            print(f"\n[Pre-notch] Seeding {len(notches)} notch(es) in body...")
+            notch_list = []
+            for n in notches:
+                notch_list.append({
+                    'start': list(n['start']),
+                    'end': list(n['end']),
+                    'damage': n.get('damage', 0.9)
+                })
+            simulator.apply_pre_notch(notch_list)
 
     # Statistics logging
     stats_log = []
