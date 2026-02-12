@@ -48,8 +48,8 @@ material:
   poissons_ratio: 0.35             # Poisson's ratio (0.0-0.5)
 
   # Phase field fracture parameters (AT2 model)
-  Gc: 30.0                         # Fracture toughness — background psi<threshold, crack tip psi>threshold
-  l0: 0.025                        # Regularization length (~1.5x dx = sharp crack band)
+  Gc: 10.0                         # Fracture toughness (low → brittle, H_ref=200)
+  l0: 0.035                        # Regularization length (~2x dx = wider damage band)
   degradation_exponent: 3.0        # Degradation function exponent
 
 # Phase field evolution parameters
@@ -58,42 +58,39 @@ phase_field:
   dC_max: 0.05                     # Maximum damage increment per step (rate limiter)
 
   # Crack-tip tracking parameters
-  crack_tip_speed: 1.5              # Tip advance speed (cells per frame, slower propagation)
-  crack_width: 0.015                # Width of damage band (narrow = thin crack lines)
-  max_total_cracks: 12              # Allow branching + multiple notch paths
+  crack_tip_speed: 4.0              # Fast tip advance → longer cracks (was 2.5)
+  crack_width: 0.02                 # Width of damage band
+  max_total_cracks: 20              # Clean lines (50 → speckle, 12 was original)
 
   # Anisotropic diffusion (for stress eigenvector computation)
   crack_aniso_ratio: 200.0          # Used for _compute_aniso_diffusion → n1_grid
 
   # Branching parameters
   branch_angle: 35.0                # Branch fork angle (degrees from parent direction)
-  branch_min_length: 6              # Minimum segments before a path can branch
-  branch_probability: 0.3           # Probability of branching per eligible tip per frame
-  max_branches_per_path: 1          # Max times a single path can branch
+  branch_min_length: 10             # Longer before branching → cleaner lines (was 6)
+  branch_probability: 0.2           # Less branching → fewer short stubs (was 0.5)
+  max_branches_per_path: 1          # Single branch per path (was 2)
 
   # Nucleation parameters
-  nucleation_fraction: 0.6          # Allow some natural nucleation in high-stress zones
-  max_nucleation_per_frame: 1       # One new crack per frame max (interior only)
-  nucleation_min_spacing: 10        # Min grid cells between crack paths
+  nucleation_fraction: 0.3           # Higher threshold → fewer nucleation events
+  max_nucleation_per_frame: 1       # One nucleation per frame max
+  nucleation_min_spacing: 12        # Wide spacing between nucleation sites
 
 # Seismic loading (earthquake ground motion)
 seismic:
   enabled: true                     # Enable oscillating ground acceleration
-  amplitude: 500.0                  # Peak ground acceleration — moderate (only crack tip exceeds Gc)
+  amplitude: 1500.0                 # Peak ground acceleration — strong (ψ exceeds H_ref across body)
   frequency: 80.0                   # Oscillation frequency (Hz) — ~4 cycles in 0.05s sim time
-  direction: [1.0, 0.0, 0.0]       # Shaking direction (horizontal x-axis)
+  direction: [1.0, 0.3, 0.0]       # Shaking direction (mostly x + some y for wider stress)
   ramp_time: 0.005                  # Ramp-up time (seconds) to avoid initial shock
 
 # Pre-notch configuration (initial crack seeds — multiple directions)
 pre_notch:
   enabled: true                     # Enable pre-notch (deterministic crack locations)
   notches:
-    - start: [0.30, 0.45, 0.50]    # Horizontal cut across torso (x-axis)
+    - start: [0.30, 0.45, 0.50]    # Horizontal cut across upper torso
       end: [0.70, 0.45, 0.50]
       damage: 0.9
-    - start: [0.40, 0.55, 0.42]    # Diagonal cut (angled across body)
-      end: [0.60, 0.35, 0.58]
-      damage: 0.85
     - start: [0.48, 0.30, 0.46]    # Near-vertical cut (up through body)
       end: [0.52, 0.65, 0.54]
       damage: 0.85
@@ -154,7 +151,7 @@ rendering:
     fov: 50.0                        # Field of view (degrees)
 
   # Animation settings
-  total_frames: 150                  # Total frames to simulate (more time for crack development)
+  total_frames: 100                  # Quick iteration (100 frames)
   fps: 30                            # Output video framerate
   physics_substeps: 10               # MPM steps per render frame (doubled for halved dt)
 

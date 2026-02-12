@@ -923,8 +923,10 @@ class HybridCrackSimulator:
                     smooth_dir = smooth_dir / sm
             self.crack_dirs[path_idx] = smooth_dir
 
-            # Constant speed once nucleated
-            speed = crack_tip_speed * dx
+            # Energy-proportional tip speed (Griffith criterion: G ∝ H)
+            # Floor at 0.5 so tips keep moving even in low-H regions
+            speed_scale = min(H_local / (H_ref + 1e-12), 5.0)
+            speed = crack_tip_speed * dx * max(speed_scale, 0.5)
             new_tip = (tip + speed * smooth_dir).clamp(dx, 1.0 - dx)
 
             # Constrain tip to stay inside occupied grid cells
@@ -989,9 +991,29 @@ class HybridCrackSimulator:
                 print(f"  [BRANCH] New fork at [{tip_pos[0]:.3f},{tip_pos[1]:.3f},{tip_pos[2]:.3f}] "
                       f"angle=±{branch_angle}°", flush=True)
 
-        # --- 5) Assign damage from crack paths to particles ---
+        # --- 5) AT2 phase field PDE solve (variational damage) ---
+        # Seed c_grid from particle damage on first step (pre-notch initial condition)
+        if step == 0 and self.c_vol.max() > 0:
+            c_from_vol = self._bin_particles_to_grid(self.c_vol)
+            self.c_grid = torch.maximum(self.c_grid, c_from_vol)
+
+        # Seed H along tracked crack paths (crack-surface stress singularity)
+        # Physical basis: LEFM K → ∞ at crack surface → AT2 limit H → ∞
+        # This provides the boundary condition that AT2 needs to create
+        # high damage (c → 1) along existing crack paths
+        H_crack = H_ref * 5.0
+        for path in self.crack_paths:
+            gi = (path * n).long().clamp(0, n - 1)  # (M, 3)
+            current_H = self.H_grid[gi[:, 0], gi[:, 1], gi[:, 2]]
+            self.H_grid[gi[:, 0], gi[:, 1], gi[:, 2]] = torch.maximum(
+                current_H, torch.full_like(current_H, H_crack)
+            )
+
         c_old = self.c_vol.clone()
-        self._assign_crack_damage(crack_width)
+        at2_iters = 50 if step < 3 else 30  # more iterations for cold start
+        self._solve_at2_phase_field(n_iters=at2_iters)
+        self._gather_grid_to_particles()
+        self.c_vol = torch.maximum(self.c_vol, c_old)  # irreversibility
 
         # --- 6) Diagnostics ---
         if step < 5 or step % 20 == 0:
@@ -1000,8 +1022,11 @@ class HybridCrackSimulator:
             max_len = max((p.shape[0] for p in self.crack_paths), default=0)
             n_cracked = (self.c_vol > 0.3).sum().item()
             dc = self.c_vol - c_old
-            print(f"  [crack-tip {step:3d}] paths={n_paths} pts={total_pts} "
-                  f"max_seg={max_len} c_max={self.c_vol.max():.4f} "
+            cg_max = self.c_grid.max().item()
+            cg_cells = (self.c_grid > 0.3).sum().item()
+            print(f"  [AT2 {step:3d}] paths={n_paths} pts={total_pts} "
+                  f"max_seg={max_len} c_vol={self.c_vol.max():.4f} "
+                  f"c_grid={cg_max:.4f}({cg_cells}cells) "
                   f"cracked(>0.3)={n_cracked} dc_max={dc.max():.6f} "
                   f"H_max={self.H_grid.max():.2e} H_ref={H_ref:.2e} "
                   f"nuc_new={n_new}",
@@ -1010,8 +1035,73 @@ class HybridCrackSimulator:
         self._hybrid_step += 1
 
     @torch.no_grad()
+    def _solve_at2_phase_field(self, n_iters: int = 30):
+        """
+        Solve AT2 phase field equilibrium on grid via Jacobi iteration.
+
+        Minimizes the Ambrosio-Tortorelli (AT2) energy functional:
+            E(c) = ∫ [g(c)·H + Gc/(2l₀)(c² + l₀²|∇c|²)] dx
+
+        where g(c) = (1-c)² (quadratic degradation),
+              H = max_t ψ(ε(t)) (strain energy history).
+
+        Euler-Lagrange stationarity condition:
+            (2H + Gc/l₀)·c - Gc·l₀·Δc = 2H
+
+        Jacobi update:
+            c = (2H + (Gc·l₀/dx²)·Σ_nbr c) / (2H + Gc/l₀ + 6·Gc·l₀/dx²)
+
+        Guarantees:
+        - Irreversibility: c_new ≥ c_old (damage only grows)
+        - Volume constraint: c = 0 outside occupied grid cells
+        - Bounds: c ∈ [0, 1]
+
+        Args:
+            n_iters: Number of Jacobi iterations (30 typical, 50 for cold start)
+        """
+        n = self.mpm.num_grids
+        dx = self.mpm.dx
+
+        Gc = getattr(self.elasticity, 'Gc', 30.0)
+        l0 = getattr(self.elasticity, 'l0', 0.025)
+
+        # Precompute constant coefficients
+        Gc_over_l0 = Gc / l0                    # e.g. 1200.0
+        Gc_l0_over_dx2 = Gc * l0 / (dx * dx)   # e.g. ~3072 for 64³ grid
+
+        # 2H driving force — (n, n, n)
+        H2 = 2.0 * self.H_grid
+
+        # Diagonal: a_ii = 2H + Gc/l₀ + 6·Gc·l₀/dx²
+        diag = H2 + Gc_over_l0 + 6.0 * Gc_l0_over_dx2
+
+        c_old = self.c_grid.clone()
+        c = self.c_grid.clone()
+        occ = self.grid_occupied.float()
+
+        for _ in range(n_iters):
+            # Neumann BC via replicate padding
+            cp = torch.nn.functional.pad(
+                c.unsqueeze(0).unsqueeze(0),
+                (1, 1, 1, 1, 1, 1), mode='replicate'
+            )[0, 0]
+
+            # Sum of 6 face-adjacent neighbors
+            nbr_sum = (cp[2:, 1:-1, 1:-1] + cp[:-2, 1:-1, 1:-1] +
+                       cp[1:-1, 2:, 1:-1] + cp[1:-1, :-2, 1:-1] +
+                       cp[1:-1, 1:-1, 2:] + cp[1:-1, 1:-1, :-2])
+
+            # Jacobi update: c = (rhs + off-diag) / diag
+            c = (H2 + Gc_l0_over_dx2 * nbr_sum) / (diag + 1e-12)
+            c = c.clamp(0.0, 1.0)
+            c = c * occ           # zero outside object volume
+            c = torch.maximum(c, c_old)  # irreversibility
+
+        self.c_grid = c
+
+    @torch.no_grad()
     def _assign_crack_damage(self, crack_width: float = 0.025):
-        """Assign damage to particles based on proximity to crack paths."""
+        """Assign damage to particles based on proximity to crack paths (legacy geometric)."""
         if not self.crack_paths:
             return
 

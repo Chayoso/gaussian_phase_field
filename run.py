@@ -909,36 +909,6 @@ def run_simulation(config: OmegaConf, simulator, camera, args):
         if config.simulation.save_frames:
             save_image(image, frame_dir / f"frame_{frame:04d}.png")
 
-            # Save depth map
-            # Normalize depth to [0, 1] for visualization
-            depth_vis = depth.squeeze()  # Remove channel dimension if present
-            if depth_vis.numel() > 0:
-                depth_min = depth_vis.min()
-                depth_max = depth_vis.max()
-                if depth_max > depth_min:
-                    depth_normalized = (depth_vis - depth_min) / (depth_max - depth_min)
-                else:
-                    depth_normalized = torch.zeros_like(depth_vis)
-
-                # Convert to 3-channel for saving (grayscale)
-                depth_rgb = depth_normalized.unsqueeze(0).repeat(3, 1, 1)
-                save_image(depth_rgb, frame_dir / f"depth_{frame:04d}.png")
-
-            # Save normal map
-            if normal is not None:
-                # Create object mask from depth (background should be black)
-                object_mask_normal = (depth > 0).float().repeat(3, 1, 1)  # (3, H, W)
-
-                # Normal map is typically (3, H, W) with values in [-1, 1]
-                # Convert to [0, 1] for visualization: (normal + 1) / 2
-                normal_vis = (normal + 1.0) / 2.0
-                normal_vis = torch.clamp(normal_vis, 0, 1)
-
-                # Apply mask: object pixels = normal, background = black (0, 0, 0)
-                normal_vis = normal_vis * object_mask_normal  # Background becomes (0, 0, 0)
-
-                save_image(normal_vis, frame_dir / f"normal_{frame:04d}.png")
-
         # Save checkpoint if requested
         if config.simulation.save_checkpoint:
             if frame % config.simulation.checkpoint_interval == 0 and frame > 0:
