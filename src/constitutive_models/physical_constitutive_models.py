@@ -428,16 +428,9 @@ class PhaseFieldElasticity(Elasticity):
         S_plus  = lam * tr_plus  * I + 2 * mu * E_plus
         S_minus = lam * tr_minus * I + 2 * mu * E_minus
 
-        # 🆕 Enhanced stiffness degradation by cracks: higher damage leads to greater stiffness reduction
-        
-        # make exponent configurable; default=3
-        exp = getattr(self, "damage_exp", 3)
-        g = (1.0 - c).pow(exp) + self.k
-        
-        # Set stiffness to nearly zero if damage exceeds threshold
-        damage_threshold = 0.8
-        mask_cracked = c.squeeze(-1) > damage_threshold
-        g[mask_cracked] = self.k  # Cracked parts maintain only minimum stiffness
+        # AT2 standard degradation: g(c) = (1-c)^2 + k
+        # Must match AT2 Euler-Lagrange: g'(c) = -2(1-c)
+        g = (1.0 - c).pow(2) + self.k
         
         # return Kirchhoff tau = F S F^T
         tau = F @ (g * S_plus + S_minus) @ F.transpose(1, 2)
@@ -499,7 +492,7 @@ class CorotatedPhaseFieldElasticity(Elasticity):
         super().__init__()
         self.register_buffer('log_E', torch.Tensor([2.0e6]).log())
         self.register_buffer('nu', torch.Tensor([0.4]))
-        self.register_buffer('k', torch.Tensor([1e-9]))  # Residual stiffness
+        self.register_buffer('k', torch.Tensor([1e-6]))  # Residual stiffness (numerical regularization)
         # Phase field fracture parameters (AT2 model)
         self.Gc = Gc    # Fracture toughness (J/m²) — energy needed to fully crack
         self.l0 = l0    # Regularization length — controls crack width (~2-3x dx)
@@ -561,13 +554,8 @@ class CorotatedPhaseFieldElasticity(Elasticity):
         dPsi_plus = 2.0 * mu * eps_plus + lam * tr_plus      # (N, 3)
         dPsi_minus = 2.0 * mu * eps_minus + lam * tr_minus    # (N, 3)
 
-        # 7. Degradation function g(c)
-        exp = getattr(self, "damage_exp", 3)
-        g = (1.0 - c).pow(exp) + self.k  # (N, 1)
-
-        # Hard cutoff for heavily damaged particles
-        mask_cracked = c.squeeze(-1) > 0.8
-        g[mask_cracked] = self.k
+        # 7. AT2 degradation: g(c) = (1-c)^2 + k
+        g = (1.0 - c).pow(2) + self.k  # (N, 1)
 
         # 8. Combine: degraded tension + undegraded compression
         P_hat = (g * dPsi_plus + dPsi_minus) * sigma  # (N, 3)

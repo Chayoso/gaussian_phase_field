@@ -292,6 +292,20 @@ def setup_mpm(config: OmegaConf, volume_pcd, device: torch.device):
     if hasattr(config.mpm, 'particle_chunk'):
         mpm_model.particle_chunk = config.mpm.particle_chunk
 
+    # Add ground plane collision if configured
+    if hasattr(config, 'ground_plane') and config.ground_plane.get('enabled', False):
+        from src.mpm_core.set_boundary_conditions import add_surface_collider
+        gp = config.ground_plane
+        add_surface_collider(
+            model=mpm_model,
+            point=list(gp.get('point', [0.5, 0.1, 0.5])),
+            normal=list(gp.get('normal', [0.0, 1.0, 0.0])),
+            surface=gp.get('surface_type', 'slip'),
+            friction=float(gp.get('friction', 0.5)),
+        )
+        print(f"  - Ground plane: point={list(gp.point)}, "
+              f"normal={list(gp.normal)}, type={gp.surface_type}")
+
     return mpm_model
 
 
@@ -403,7 +417,8 @@ def setup_simulator(
     gaussians,
     elasticity,
     surface_mask,
-    device: torch.device
+    device: torch.device,
+    loading_params: dict = None
 ):
     """
     Create hybrid MPM + Gaussian Splats simulator
@@ -476,8 +491,12 @@ def setup_simulator(
     # Seismic loading parameters (earthquake ground motion)
     seismic_params = {}
     if hasattr(config, 'seismic'):
+        seismic_enabled = config.seismic.get("enabled", False)
+        # Loading type can override seismic enable/disable
+        if loading_params and loading_params.get("seismic_override") is not None:
+            seismic_enabled = loading_params["seismic_override"]
         seismic_params = {
-            "enabled": config.seismic.get("enabled", False),
+            "enabled": seismic_enabled,
             "amplitude": float(config.seismic.get("amplitude", 1000.0)),
             "frequency": float(config.seismic.get("frequency", 80.0)),
             "direction": list(config.seismic.get("direction", [1.0, 0.0, 0.0])),
@@ -527,7 +546,9 @@ def setup_camera(config: OmegaConf):
     elev_rad = np.radians(cam_config.elevation)
     azim_rad = np.radians(cam_config.azimuth)
     distance = cam_config.distance
-    target = np.array([0.5, 0.5, 0.5])  # Mesh center
+    # Camera target: configurable, defaults to mesh center [0.5, 0.5, 0.5]
+    target_cfg = cam_config.get('target', [0.5, 0.5, 0.5])
+    target = np.array(list(target_cfg))
 
     # Compute eye position from orbital parameters
     x = target[0] + distance * np.cos(elev_rad) * np.cos(azim_rad)
@@ -557,14 +578,14 @@ def setup_camera(config: OmegaConf):
         "zfar": 100.0,
         "lookat": {
             "eye": eye,
-            "target": [0.5, 0.5, 0.5],
+            "target": target.tolist(),
             "up": [0.0, 0.0, 1.0]  # Z-up
         }
     }
 
     print(f"\n[Camera Setup]")
     print(f"  - Eye: [{eye[0]:.3f}, {eye[1]:.3f}, {eye[2]:.3f}]")
-    print(f"  - Target: [0.5, 0.5, 0.5]")
+    print(f"  - Target: [{target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f}]")
     print(f"  - Intrinsics: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
     print(f"  - FOV: {fov_deg}°")
 
@@ -731,7 +752,15 @@ def run_simulation(config: OmegaConf, simulator, camera, args):
 
     start_time = time.time()
 
+    # Enable diagnostic data saving at key frames
+    simulator._save_diagnostics = True
+    simulator._output_dir = config.output.get('frame_dir', 'output/frames').replace('/frames', '')
+    # Diagnostic at rendering frames: pre-impact, impact, post-impact, settled
+    simulator._diag_frames = {0, 10, 20, 30, 40, 44, 45, 46, 47, 48, 50, 55, 60, 70, 80, 90, 99}
+
     for frame in range(config.rendering.total_frames):
+        # Pass rendering frame number for diagnostics (no reset overlap)
+        simulator._render_frame = frame
         # Physics + Gaussian update (always runs)
         simulator.step_rendering()
 
@@ -991,6 +1020,149 @@ def create_video(frame_dir: Path, output_path: str, fps: int):
 
 
 # ============================================================================
+# Loading Conditions
+# ============================================================================
+
+def setup_loading(config: OmegaConf, mpm_model, device: torch.device):
+    """
+    Configure loading conditions based on config.loading.type.
+
+    Sets up gravity, ground plane, compression plates, etc. on the MPM model.
+    Returns a dict that may override seismic enable/disable.
+
+    Backward compatible: if no loading section exists, infers from legacy flags.
+    """
+    loading_type = None
+    if hasattr(config, 'loading'):
+        loading_type = config.loading.get('type', None)
+
+    # Backward compatibility: infer from legacy flags
+    if loading_type is None:
+        if hasattr(config, 'seismic') and config.seismic.get('enabled', False):
+            loading_type = "seismic"
+        elif hasattr(config, 'external_force') and config.external_force.get('enabled', False):
+            loading_type = "point_impact"
+        else:
+            loading_type = "seismic"
+
+    print(f"\n[Loading] Type: {loading_type}")
+    result = {"type": loading_type}
+
+    if loading_type == "gravity_drop":
+        # Gravity scaling for MPM normalized space [0,1]³ (Z-down gravity):
+        # Total sim time = frames × substeps × dt (e.g., 200×10×5e-5 = 0.1s)
+        # To fall ~0.4 units (z=0.7 to ground z=0.05) in sim time:
+        #   d = 0.5 * g_eff * t² → g_eff = 2d/t²
+        total_frames = config.rendering.get('total_frames', 100)
+        substeps = config.rendering.get('physics_substeps', 10)
+        dt = float(config.mpm.dt)
+        total_time = total_frames * substeps * dt
+        target_fall = 0.35  # units to fall in normalized space
+
+        # Compute needed gravity: d = 0.5 * g * t²  → g = 2d/t²
+        g_needed = 2.0 * target_fall / (total_time ** 2) if total_time > 0 else 500.0
+        g_needed = max(g_needed, 200.0)  # minimum effective gravity
+        g_needed = min(g_needed, 5000.0)  # safety cap
+
+        # Gravity in -Z direction (Z-up coordinate system, matching camera)
+        mpm_model.gravity = torch.tensor([0.0, 0.0, -g_needed], device=device)
+        print(f"  - Effective gravity: [0, 0, {-g_needed:.1f}]  (sim_time={total_time:.4f}s)")
+
+        # Reduce damping for gravity_drop: preserve kinetic energy for impact
+        # Original damping (0.98) = 2% energy loss per substep → very overdamped
+        # Use 0.9995 for near-free-fall until impact
+        mpm_model.damping = 0.9995
+        print(f"  - Damping: {mpm_model.damping} (near-free-fall for impact)")
+
+        # Auto-enable ground plane if not already configured (Z-normal)
+        if not (hasattr(config, 'ground_plane') and config.ground_plane.get('enabled', False)):
+            from src.mpm_core.set_boundary_conditions import add_surface_collider
+            add_surface_collider(
+                model=mpm_model,
+                point=[0.5, 0.5, 0.1],
+                normal=[0.0, 0.0, 1.0],
+                surface="slip",
+                friction=0.5,
+            )
+            print(f"  - Auto-enabled ground plane at z=0.1 (slip)")
+
+        # Warmup: frame_count resets at impact, so use a short warmup (3-5 frames)
+        # to let initial impact stress build before nucleating cracks
+        warmup_val = config.phase_field.get('warmup_frames', 3)
+        warmup_val = min(warmup_val, 10)  # cap at 10 for gravity_drop
+        OmegaConf.update(config, "phase_field.warmup_frames", warmup_val)
+        print(f"  - warmup_frames={warmup_val} (resets at impact)")
+
+        # Disable seismic for gravity_drop
+        result["seismic_override"] = False
+        print(f"  - Seismic: OFF (gravity_drop mode)")
+
+    elif loading_type == "compression":
+        comp = config.loading.get('compression', {})
+        axis = int(comp.get('axis', 0))
+        speed = float(comp.get('speed', 0.5))
+        start_pos = float(comp.get('start_position', 0.1))
+        end_pos = float(comp.get('end_position', 0.9))
+
+        from src.mpm_core.set_boundary_conditions import set_velocity_on_cuboid
+
+        # Lower plate: moves in +axis direction
+        lower_point = [0.5, 0.5, 0.5]
+        lower_point[axis] = start_pos
+        lower_size = [0.5, 0.5, 0.5]
+        lower_size[axis] = 0.02
+        lower_vel = [0.0, 0.0, 0.0]
+        lower_vel[axis] = speed
+
+        set_velocity_on_cuboid(
+            model=mpm_model,
+            point=lower_point,
+            size=lower_size,
+            velocity=lower_vel,
+        )
+
+        # Upper plate: moves in -axis direction
+        upper_point = [0.5, 0.5, 0.5]
+        upper_point[axis] = end_pos
+        upper_size = [0.5, 0.5, 0.5]
+        upper_size[axis] = 0.02
+        upper_vel = [0.0, 0.0, 0.0]
+        upper_vel[axis] = -speed
+
+        set_velocity_on_cuboid(
+            model=mpm_model,
+            point=upper_point,
+            size=upper_size,
+            velocity=upper_vel,
+        )
+
+        result["seismic_override"] = False
+        axis_names = ["X", "Y", "Z"]
+        print(f"  - Compression axis: {axis_names[axis]}")
+        print(f"  - Plate speed: {speed}")
+        print(f"  - Plates: [{start_pos}] --> <-- [{end_pos}]")
+        print(f"  - Seismic: OFF (compression mode)")
+
+    elif loading_type == "point_impact":
+        result["seismic_override"] = False
+        print(f"  - Using external_force config for point impact")
+        print(f"  - Seismic: OFF (point_impact mode)")
+
+    elif loading_type == "seismic":
+        # Default: use existing seismic system
+        result["seismic_override"] = None  # don't override
+        print(f"  - Using seismic config (existing behavior)")
+
+    else:
+        raise ValueError(
+            f"Unknown loading type: '{loading_type}'. "
+            f"Options: seismic, gravity_drop, point_impact, compression"
+        )
+
+    return result
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -1002,6 +1174,11 @@ def main():
     # Load and apply configuration
     config = load_config(args.config)
     config = apply_cli_overrides(config, args)
+
+    # Apply material preset (if specified)
+    from src.core.material_presets import resolve_material_preset, validate_l0
+    config = resolve_material_preset(config)
+    config = validate_l0(config)
 
     # Setup device
     device_type = config.device.type
@@ -1024,16 +1201,46 @@ def main():
         # Pipeline execution
         volume_pcd, surface_pcd, surface_mask = setup_mesh(config)
         mpm_model = setup_mpm(config, volume_pcd, device)
+        loading_params = setup_loading(config, mpm_model, device)
         elasticity = setup_elasticity(config, device)
         gaussians = setup_gaussians(config, surface_pcd, device)
 
         simulator = setup_simulator(
             config, mpm_model, gaussians, elasticity,
-            surface_mask, device
+            surface_mask, device, loading_params=loading_params
         )
 
         # Initialize simulation
         simulator.initialize(torch.from_numpy(volume_pcd.points).float().to(device))
+
+        # Enable gravity drop mode if loading type is gravity_drop
+        # Z-up coordinate system: gravity in -Z, ground plane at z=ground_z
+        if loading_params.get("type") == "gravity_drop":
+            ground_z = 0.1  # default
+            if hasattr(config, 'ground_plane') and config.ground_plane.get('enabled', False):
+                ground_z = float(config.ground_plane.get('point', [0.5, 0.5, 0.1])[2])
+
+            # Scale down and reposition object for drop:
+            # Object fills [0.025, 0.975] → need to shrink to ~1/3 and raise above ground
+            drop_scale = config.loading.get('drop_scale', 0.33)
+            drop_center_z = config.loading.get('drop_center_z', 0.7)
+
+            # Scale all MPM positions around center [0.5, 0.5, 0.5]
+            center = torch.tensor([0.5, 0.5, 0.5], device=device)
+            simulator.x_mpm = center + (simulator.x_mpm - center) * drop_scale
+            # Shift z so object center is at drop_center_z
+            z_current_center = (simulator.x_mpm[:, 2].min().item() + simulator.x_mpm[:, 2].max().item()) / 2
+            z_shift = drop_center_z - z_current_center
+            simulator.x_mpm[:, 2] += z_shift
+
+            z_min = simulator.x_mpm[:, 2].min().item()
+            z_max = simulator.x_mpm[:, 2].max().item()
+            print(f"[GravityDrop] Rescaled object: scale={drop_scale}, "
+                  f"center_z={drop_center_z}")
+            print(f"  - z range: [{z_min:.4f}, {z_max:.4f}]")
+            print(f"  - Fall distance to ground: {z_min - ground_z:.4f}")
+
+            simulator.enable_gravity_drop(ground_z=ground_z)
 
         # Setup camera
         camera = setup_camera(config)

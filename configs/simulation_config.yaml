@@ -38,6 +38,7 @@ mpm:
 
 # Material properties
 material:
+  preset: null                      # Material preset: "concrete" | "glass" | "ceramic" | "wood" | "steel" | null
   constitutive_model: "corotated_phase_field"  # "phase_field" (SVK) | "corotated_phase_field"
   center: [0.5, 0.5, 0.5]          # Material center (MPM space)
   size: [0.8, 0.8, 0.8]            # Material extent
@@ -103,6 +104,23 @@ external_force:
   magnitude: 5.0                    # Impact energy (normalized)
   radius: 0.03                      # Impact radius (small point, ~2 grid cells)
   direction: null                   # Force direction (null = radial)
+
+# Ground plane collision (Z-up coordinate system)
+ground_plane:
+  enabled: false                    # Enable ground plane
+  point: [0.5, 0.5, 0.1]          # Point on the plane (MPM space [0,1]³)
+  normal: [0.0, 0.0, 1.0]         # Outward normal (Z-up = floor at z=0.1)
+  surface_type: "slip"             # "sticky" | "slip" | "collide"
+  friction: 0.5                    # Coulomb friction coefficient
+
+# Loading condition type
+loading:
+  type: "seismic"                  # "seismic" | "gravity_drop" | "point_impact" | "compression"
+  compression:                     # Only used when type: "compression"
+    axis: 0                        # Squeeze axis: 0=x, 1=y, 2=z
+    speed: 0.5                     # Inward velocity of each plate
+    start_position: 0.1            # Initial position of lower plate
+    end_position: 0.9              # Initial position of upper plate
 
 # Coordinate mapping (MPM ↔ World space)
 coordinate_mapping:
