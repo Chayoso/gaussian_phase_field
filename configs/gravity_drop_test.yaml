@@ -57,6 +57,9 @@ phase_field:
   nucleation_fraction: 0.35
   max_nucleation_per_frame: 1
   nucleation_min_spacing: 10
+  fragmentation_enabled: true
+  fragment_damage_threshold: 0.5
+  min_fragment_particles: 50
 
 seismic:
   enabled: true                   # Overridden to false by gravity_drop

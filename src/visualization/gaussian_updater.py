@@ -165,21 +165,19 @@ class GaussianCrackVisualizer:
             opening_mag[edge_zone] = self.max_opening * t_e * (1.0 - t_e) * 4.0
         gaussians._xyz.data = positions + v_perp_hat * opening_mag.unsqueeze(1)
 
-        # 2. Dark interior line (cubic falloff)
-        dark_sh = self._dark_sh.to(device).unsqueeze(0)
-        red_sh = self._red_sh.to(device).unsqueeze(0)
-
-        darken_amount = torch.zeros(N, device=device)
-        in_crack = norm_dist < 1.0
-        if in_crack.any():
-            t = norm_dist[in_crack].clamp(0.0, 1.0)
-            darken_amount[in_crack] = (1.0 - t) ** 3
-
-        d = darken_amount.unsqueeze(1).unsqueeze(1)
-        current_dc = gaussians._features_dc.data
-        gaussians._features_dc.data = (1.0 - d) * current_dc + d * dark_sh
-        current_rest = gaussians._features_rest.data
-        gaussians._features_rest.data = current_rest * (1.0 - d)
+        # 2. Dark interior line (DISABLED)
+        # dark_sh = self._dark_sh.to(device).unsqueeze(0)
+        # red_sh = self._red_sh.to(device).unsqueeze(0)
+        # darken_amount = torch.zeros(N, device=device)
+        # in_crack = norm_dist < 1.0
+        # if in_crack.any():
+        #     t = norm_dist[in_crack].clamp(0.0, 1.0)
+        #     darken_amount[in_crack] = (1.0 - t) ** 3
+        # d = darken_amount.unsqueeze(1).unsqueeze(1)
+        # current_dc = gaussians._features_dc.data
+        # gaussians._features_dc.data = (1.0 - d) * current_dc + d * dark_sh
+        # current_rest = gaussians._features_rest.data
+        # gaussians._features_rest.data = current_rest * (1.0 - d)
 
         # 3. Scale shrinkage at crack center
         scale_factor = torch.ones(N, device=device)
@@ -201,16 +199,16 @@ class GaussianCrackVisualizer:
         new_prob = (current_prob * opacity_factor.unsqueeze(1)).clamp(1e-6, 1 - 1e-6)
         gaussians._opacity.data = torch.log(new_prob / (1.0 - new_prob))
 
-        # 5. Red accent at boundary
-        if self.red_accent > 0:
-            red_zone = (norm_dist >= 0.75) & (norm_dist < 1.05)
-            red_amount = torch.zeros(N, device=device)
-            if red_zone.any():
-                t_r = ((norm_dist[red_zone] - 0.9) / 0.15).clamp(-1.0, 1.0)
-                red_amount[red_zone] = self.red_accent * (1.0 - t_r * t_r)
-            r = red_amount.unsqueeze(1).unsqueeze(1)
-            dc = gaussians._features_dc.data
-            gaussians._features_dc.data = (1.0 - r) * dc + r * red_sh
+        # 5. Red accent at boundary (DISABLED)
+        # if self.red_accent > 0:
+        #     red_zone = (norm_dist >= 0.75) & (norm_dist < 1.05)
+        #     red_amount = torch.zeros(N, device=device)
+        #     if red_zone.any():
+        #         t_r = ((norm_dist[red_zone] - 0.9) / 0.15).clamp(-1.0, 1.0)
+        #         red_amount[red_zone] = self.red_accent * (1.0 - t_r * t_r)
+        #     r = red_amount.unsqueeze(1).unsqueeze(1)
+        #     dc = gaussians._features_dc.data
+        #     gaussians._features_dc.data = (1.0 - r) * dc + r * red_sh
 
     def update_gaussians(
         self,

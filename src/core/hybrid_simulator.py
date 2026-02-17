@@ -19,6 +19,7 @@ from src.constitutive_models.phase_field import update_phase_field
 from src.constitutive_models.damage_mapper import VolumetricToSurfaceDamageMapper
 from src.visualization.gaussian_updater import GaussianCrackVisualizer
 from src.core.coordinate_mapper import CoordinateMapper
+from src.core.fragment_manager import FragmentManager
 
 
 class HybridCrackSimulator:
@@ -81,6 +82,15 @@ class HybridCrackSimulator:
         self.init_positions = None
 
         device = next(mpm_model.parameters()).device if hasattr(mpm_model, 'parameters') else torch.device('cuda')
+
+        # Fragment tracking
+        frag_enabled = self.pf_params.get('fragmentation_enabled', False)
+        self.fragment_manager = FragmentManager(
+            damage_threshold=self.pf_params.get('fragment_damage_threshold', 0.5),
+            min_fragment_particles=self.pf_params.get('min_fragment_particles', 50),
+            device=str(device),
+        ) if frag_enabled else None
+        self.fragmentation_active = False
 
         print(f"\n{'='*60}")
         print(f"HybridCrackSimulator Initialized")
@@ -1018,6 +1028,15 @@ class HybridCrackSimulator:
             return
 
         # Phase 2: full MPM physics
+        # Graduated damping: aggressive right after impact, taper to steady-state.
+        # Simulates fracture energy absorption that geometric cracks don't capture.
+        if self._gravity_drop and self._gravity_drop_contacted:
+            frames_since = getattr(self, '_impact_frame_count', 0)
+            if frames_since < 8:
+                self.mpm.damping = 0.93 + 0.006 * frames_since
+            else:
+                self.mpm.damping = 0.978
+
         self._apply_seismic_loading(dt)
 
         stress = self.elasticity(self.F, c=self.c_vol)
@@ -1026,14 +1045,40 @@ class HybridCrackSimulator:
         self._last_stress = stress.detach()
 
         x_old = self.x_mpm.clone()
-        self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
-            self.x_mpm, self.v_mpm, self.C, self.F, stress)
+
+        if self.fragmentation_active and self.fragment_manager.n_fragments > 1:
+            # Per-fragment p2g2p: each fragment gets independent grid physics
+            for frag_idx in self.fragment_manager.fragment_particle_indices:
+                if len(frag_idx) < self.fragment_manager.min_fragment_particles:
+                    self.v_mpm[frag_idx] += dt * self.mpm.gravity.unsqueeze(0)
+                    self.x_mpm[frag_idx] += self.v_mpm[frag_idx] * dt
+                    self.x_mpm[frag_idx] = self.x_mpm[frag_idx].clamp(
+                        self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
+                    continue
+                self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p_subset(
+                    self.x_mpm, self.v_mpm, self.C, self.F, stress, frag_idx)
+            self.mpm.time += dt
+        else:
+            self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
+                self.x_mpm, self.v_mpm, self.C, self.F, stress)
 
         # Velocity & F clamping
         v_limit = 0.4 * self.mpm.dx / dt
         if self._gravity_drop and self._gravity_drop_contacted:
             v_limit = min(v_limit, 25.0)
         self.v_mpm = self.v_mpm.clamp(-v_limit, v_limit)
+
+        # Suppress elastic rebound after impact.
+        # In brittle fracture KE is absorbed by crack surfaces; our geometric
+        # cracks don't consume KE, so we damp upward velocity explicitly.
+        if self._gravity_drop and self._gravity_drop_contacted:
+            frames_since = getattr(self, '_impact_frame_count', 0)
+            if frames_since < 10:
+                vz = self.v_mpm[:, 2]
+                upward = vz > 0
+                if upward.any():
+                    factor = min(1.0, 0.80 + 0.02 * frames_since)
+                    vz[upward] *= factor
 
         F_limit = 1.5 if (self._gravity_drop and self._gravity_drop_contacted) else 2.0
         self.F = self.F.clamp(-F_limit, F_limit)
@@ -1143,7 +1188,7 @@ class HybridCrackSimulator:
               f"(direction from physics -∇H)")
 
         # Post-impact adjustments
-        post_g = -20.0
+        post_g = -50.0
         g_vec = self.mpm.gravity.clone()
         g_vec[:] = 0.0
         g_vec[2] = post_g
@@ -1178,6 +1223,18 @@ class HybridCrackSimulator:
                 self.step_hybrid_crack(self.mpm.dt)
         torch.cuda.empty_cache()
 
+        # Fragment detection: trigger once after burst mode completes
+        if (self.fragment_manager is not None
+                and not self.fragmentation_active
+                and self._gravity_drop and self._gravity_drop_contacted
+                and hasattr(self, '_impact_frame_count')
+                and self._impact_frame_count == 3
+                and hasattr(self, 'grid_occupied')
+                and hasattr(self, 'crack_paths') and len(self.crack_paths) > 0):
+            n_frags = self._detect_fragments_from_crack_planes()
+            if n_frags > 1:
+                self.fragmentation_active = True
+
         # Project damage to surface and update Gaussians
         x_surf_mpm = self.x_mpm[self.surface_mask]
         c_surf = self.damage_mapper.project_damage(
@@ -1202,6 +1259,104 @@ class HybridCrackSimulator:
         if hasattr(self, '_impact_frame_count'):
             self._impact_frame_count += 1
         return True
+
+    # ================================================================
+    # Fragment detection
+    # ================================================================
+
+    @torch.no_grad()
+    def _detect_fragments_from_crack_planes(self) -> int:
+        """Build planar crack surfaces from polylines and run CC.
+
+        Each crack path defines a cutting plane:
+        - The plane passes through the crack polyline
+        - It extends vertically (in Z) and radially from the impact center
+        - Grid cells near the plane are marked as cracked
+        - CC on the remaining material gives fragments
+        """
+        n = self.mpm.num_grids
+        dx = 1.0 / n
+        device = self.x_mpm.device
+
+        # Impact center for radial direction computation
+        impact_center = getattr(self, '_impact_center',
+                                self.x_mpm.mean(dim=0))
+        ic_xy = impact_center[:2]  # XY components
+
+        # Grid cell centers
+        coords = (torch.arange(n, device=device).float() + 0.5) / n
+
+        damage_grid = torch.zeros(n, n, n, device=device)
+        plane_thickness = 2.5 * dx  # ~2.5 cells wide barrier
+
+        # Group crack paths by unique radial angle to avoid duplicate planes
+        seen_angles = []
+        unique_planes = []
+
+        for path in self.crack_paths:
+            if path.shape[0] < 2:
+                continue
+            # Compute average radial direction in XY from impact center
+            path_center = path.mean(dim=0)
+            radial = path_center[:2] - ic_xy
+            if radial.norm() < 1e-6:
+                continue
+            radial = radial / radial.norm()
+            angle = torch.atan2(radial[1], radial[0]).item()
+
+            # Skip near-duplicate angles (within 5 degrees)
+            is_dup = False
+            for sa in seen_angles:
+                diff = abs(angle - sa)
+                diff = min(diff, 2 * 3.14159 - diff)
+                if diff < 0.087:  # ~5 degrees
+                    is_dup = True
+                    break
+            if is_dup:
+                continue
+            seen_angles.append(angle)
+
+            # Plane normal = perpendicular to radial in XY
+            # normal = (-radial_y, radial_x, 0)
+            normal_xy = torch.tensor([-radial[1].item(), radial[0].item()],
+                                     device=device)
+
+            # Mark grid cells close to this plane
+            # Signed distance of cell (i,j,k) to the plane passing through
+            # impact_center with normal (normal_xy, 0):
+            # d = (cell_xy - ic_xy) · normal_xy
+            # Mark if |d| < plane_thickness/2
+            cell_x = coords  # (n,)
+            cell_y = coords  # (n,)
+            # Compute signed distance for all XY positions
+            dist_x = cell_x.unsqueeze(1) - ic_xy[0]  # (n, 1)
+            dist_y = cell_y.unsqueeze(0) - ic_xy[1]  # (1, n)
+            signed_dist = dist_x * normal_xy[0] + dist_y * normal_xy[1]  # (n, n)
+            plane_mask_2d = signed_dist.abs() < (plane_thickness / 2)  # (n, n)
+
+            # Extend to 3D (all Z values)
+            plane_mask_3d = plane_mask_2d.unsqueeze(2).expand(n, n, n)
+            damage_grid[plane_mask_3d] = 1.0
+
+            unique_planes.append(angle)
+
+        # Restrict crack to material region only
+        damage_grid = damage_grid * self.grid_occupied.float()
+
+        n_crack_cells = (damage_grid > 0.5).sum().item()
+        n_occupied = self.grid_occupied.sum().item()
+        print(f"  [FRAGMENT] Built {len(unique_planes)} crack planes, "
+              f"{n_crack_cells}/{n_occupied} cells marked as crack")
+
+        n_frags = self.fragment_manager.detect_fragments(
+            damage_grid, self.grid_occupied, self.x_mpm, self.mpm)
+
+        print(f"  [FRAGMENT] CC detected {n_frags} fragments")
+        for k in range(min(n_frags, 20)):
+            nk = len(self.fragment_manager.fragment_particle_indices[k])
+            print(f"    Fragment {k}: {nk} particles")
+
+        return n_frags
 
     # ================================================================
     # Diagnostics & utilities

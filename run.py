@@ -486,6 +486,10 @@ def setup_simulator(
         "nucleation_fraction": config.phase_field.get("nucleation_fraction", 0.3),
         "max_nucleation_per_frame": config.phase_field.get("max_nucleation_per_frame", 1),
         "nucleation_min_spacing": config.phase_field.get("nucleation_min_spacing", 8),
+        # Fragmentation parameters
+        "fragmentation_enabled": config.phase_field.get("fragmentation_enabled", False),
+        "fragment_damage_threshold": config.phase_field.get("fragment_damage_threshold", 0.5),
+        "min_fragment_particles": config.phase_field.get("min_fragment_particles", 50),
     }
 
     # Seismic loading parameters (earthquake ground motion)
