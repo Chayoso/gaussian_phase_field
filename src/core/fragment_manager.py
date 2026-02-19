@@ -126,28 +126,20 @@ class FragmentManager:
             if max_label == 0:
                 continue
 
+            best_w = torch.zeros(M, device=self.device)
+            best_lab = torch.zeros(M, dtype=torch.long, device=self.device)
+
             for lab in range(1, max_label + 1):
                 mask_lab = (node_labels == lab)
                 w_lab = (weight * mask_lab.float()).sum(dim=1)
-                better = w_lab > 0
-                if not better.any():
-                    continue
-                current_best_w = torch.zeros(M, device=self.device)
-                current_best_w.scatter_(0,
-                    torch.arange(M, device=self.device),
-                    w_lab)
-                # Track best
-                if lab == 1:
-                    best_w = w_lab.clone()
-                    best_lab = torch.ones(M, dtype=torch.long,
-                                          device=self.device)
-                else:
-                    update = w_lab > best_w
+                update = w_lab > best_w
+                if update.any():
                     best_w[update] = w_lab[update]
                     best_lab[update] = lab
 
-            if max_label >= 1:
-                frag_ids[ci:cj] = best_lab
+            assigned = best_lab > 0
+            if assigned.any():
+                frag_ids[ci:cj][assigned] = best_lab[assigned]
 
         return frag_ids
 

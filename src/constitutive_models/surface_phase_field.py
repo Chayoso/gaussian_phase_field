@@ -223,7 +223,7 @@ class AdaptiveSurfacePhaseField(SurfacePhaseFieldLite):
         self,
         x: Tensor,
         k: Optional[int] = None,
-        c: Optional[Tensor] = None
+        c: Optional[Tensor] = None  
     ) -> Tensor:
         """
         Adaptive surface mask based on current damage

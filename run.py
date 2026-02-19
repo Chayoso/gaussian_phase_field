@@ -112,6 +112,13 @@ Examples:
         help="Skip video generation"
     )
 
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42)"
+    )
+
     return parser.parse_args()
 
 
@@ -1174,6 +1181,13 @@ def main():
     """Main entry point"""
     # Parse arguments
     args = parse_args()
+
+    # Deterministic seeding for reproducibility
+    seed = getattr(args, 'seed', 42) or 42
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     # Load and apply configuration
     config = load_config(args.config)

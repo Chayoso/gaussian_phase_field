@@ -48,12 +48,12 @@ phase_field:
   dC_max: 0.25
   crack_tip_speed: 8.0
   crack_width: 0.004
-  max_total_cracks: 16
+  max_total_cracks: 48
   crack_aniso_ratio: 200.0
-  branch_angle: 30.0
-  branch_min_length: 6
-  branch_probability: 0.40
-  max_branches_per_path: 2
+  branch_angle: 25.0
+  branch_min_length: 4
+  branch_probability: 0.50
+  max_branches_per_path: 3
   nucleation_fraction: 0.35
   max_nucleation_per_frame: 1
   nucleation_min_spacing: 10

@@ -210,6 +210,105 @@ class GaussianCrackVisualizer:
         #     dc = gaussians._features_dc.data
         #     gaussians._features_dc.data = (1.0 - r) * dc + r * red_sh
 
+    @torch.no_grad()
+    def _apply_hybrid_crack(self, gaussians, c_surface: Tensor,
+                            crack_paths: list, crack_width: float):
+        """Hybrid crack visualization: polyline shape × c_surface intensity.
+
+        - Polyline proximity gives sharp, branching crack geometry
+        - c_surface gates the effect so only physically damaged regions are affected
+        - Eliminates artifacts from stale paths (low c_surface → no effect)
+
+        Effect strength = polyline_proximity × c_surface_damage
+        """
+        positions = gaussians._xyz.data
+        N = positions.shape[0]
+        device = positions.device
+
+        # 1. Compute polyline proximity: sharp crack shape
+        min_dist, v_perp_hat = self._crack_geometry(positions, crack_paths, crack_width)
+        norm_dist = (min_dist / crack_width).clamp(0.0)
+
+        # Proximity factor: 1.0 at crack center → 0.0 beyond crack_width
+        prox = (1.0 - norm_dist).clamp(0.0, 1.0)
+
+        # 2. Combined strength: polyline shape × phase field damage
+        #    Close to polyline guarantees a minimum effect (crack tip visibility)
+        #    c_surface amplifies effect where damage is confirmed
+        min_prox_effect = 0.4 * prox  # polyline alone gives 40% effect
+        damage_boost = 0.6 * prox * c_surface  # damage adds remaining 60%
+        strength = min_prox_effect + damage_boost  # (N,)
+
+        affected = strength > 0.05
+        if not affected.any():
+            return
+
+        # 3. Edge displacement — push Gaussians away from crack center
+        #    Only where both proximity and damage are significant
+        disp_mask = (norm_dist >= 0.3) & (norm_dist < 1.0) & (c_surface > self.damage_threshold)
+        if disp_mask.any():
+            t_e = ((norm_dist[disp_mask] - 0.3) / 0.7).clamp(0.0, 1.0)
+            # Bell curve displacement, gated by damage
+            mag = self.max_opening * t_e * (1.0 - t_e) * 4.0 * c_surface[disp_mask]
+            disp = v_perp_hat[disp_mask] * mag.unsqueeze(1)
+            gaussians._xyz.data[disp_mask] = positions[disp_mask] + disp
+
+        # 4. Scale shrinkage — create visible gap along crack line
+        scale_mask = strength > 0.1
+        if scale_mask.any():
+            s = strength[scale_mask].clamp(0.0, 1.0)
+            # scale: 1.0 → 0.2 as strength increases
+            scale_mult = 1.0 - 0.8 * (s ** 1.5)
+            gaussians._scaling.data[scale_mask] += torch.log(
+                scale_mult.unsqueeze(1).clamp(min=0.01))
+
+        # 5. Opacity reduction — fade crack interior
+        opa_mask = strength > 0.3
+        if opa_mask.any():
+            t_o = ((strength[opa_mask] - 0.3) / 0.7).clamp(0.0, 1.0)
+            opacity_mult = 1.0 - 0.85 * (t_o ** 2)
+            cur_prob = torch.sigmoid(gaussians._opacity.data[opa_mask])
+            new_prob = (cur_prob * opacity_mult.unsqueeze(1)).clamp(1e-6, 1 - 1e-6)
+            gaussians._opacity.data[opa_mask] = torch.log(new_prob / (1.0 - new_prob))
+
+    @torch.no_grad()
+    def _apply_damage_visualization(self, gaussians, c_surface: Tensor):
+        """Phase-field damage visualization (post-fragmentation).
+
+        After fragments physically separate, the gap IS the crack.
+        We only need to show material degradation on each fragment's surface:
+        - Scale shrinkage where damage is significant → thinner splats at cracks
+        - Opacity reduction at high damage → transparency at fully broken areas
+
+        Uses smooth cubic falloff to avoid hard boundaries.
+        """
+        N = c_surface.shape[0]
+        device = c_surface.device
+        thresh = self.damage_threshold
+
+        # 1. Scale shrinkage: starts at lower threshold for gradual onset
+        low_thresh = thresh * 0.5  # Start showing effect earlier
+        damaged = c_surface > low_thresh
+        if damaged.any():
+            t = ((c_surface[damaged] - low_thresh)
+                 / (1.0 - low_thresh)).clamp(0.0, 1.0)
+            # Smooth cubic: gradual onset, strong at high damage
+            scale_mult = 1.0 - 0.9 * (t ** 2) * (3.0 - 2.0 * t)
+            gaussians._scaling.data[damaged] += torch.log(
+                scale_mult.unsqueeze(1).clamp(min=0.01))
+
+        # 2. Opacity reduction: stronger at high damage
+        opa_thresh = thresh
+        high_damage = c_surface > opa_thresh
+        if high_damage.any():
+            t_o = ((c_surface[high_damage] - opa_thresh)
+                   / (1.0 - opa_thresh)).clamp(0.0, 1.0)
+            # Aggressive fade: fully broken material should be transparent
+            opacity_mult = 1.0 - 0.95 * (t_o ** 2)
+            cur_prob = torch.sigmoid(gaussians._opacity.data[high_damage])
+            new_prob = (cur_prob * opacity_mult.unsqueeze(1)).clamp(1e-6, 1 - 1e-6)
+            gaussians._opacity.data[high_damage] = torch.log(new_prob / (1.0 - new_prob))
+
     def update_gaussians(
         self,
         gaussians,
@@ -217,9 +316,16 @@ class GaussianCrackVisualizer:
         x_world: Tensor,
         preserve_original: bool = True,
         crack_paths: list = None,
-        crack_width: float = 0.03
+        crack_width: float = 0.03,
+        debris_mask: Tensor = None,
     ):
-        """Update Gaussian properties for crack visualization."""
+        """Update Gaussian properties for crack visualization.
+
+        Args:
+            debris_mask: (N_surf,) bool — Gaussians belonging to small
+                fragments.  These are hidden (opacity → 0) before any
+                crack effects to avoid edge artifacts.
+        """
         if preserve_original and self._original_dc is None:
             self._original_dc = gaussians._features_dc.data.clone()
             self._original_rest = gaussians._features_rest.data.clone()
@@ -233,9 +339,20 @@ class GaussianCrackVisualizer:
         gaussians._opacity.data.copy_(self._original_opacity)
         gaussians._scaling.data.copy_(self._original_scaling)
 
+        # Hide debris BEFORE crack effects to prevent edge artifacts
+        if debris_mask is not None and debris_mask.any():
+            gaussians._opacity.data[debris_mask] = -20.0
+            gaussians._scaling.data[debris_mask] -= 5.0  # Shrink to ~0
+
         has_polylines = (crack_paths is not None
                          and len(crack_paths) > 0
                          and any(p.shape[0] >= 2 for p in crack_paths))
+        has_damage = (c_surface is not None
+                      and c_surface.max() > self.damage_threshold)
 
-        if has_polylines:
-            self._apply_crack_opening(gaussians, crack_paths, crack_width)
+        if has_polylines and has_damage:
+            # Pre-fragmentation: polyline shape × phase field intensity
+            self._apply_hybrid_crack(gaussians, c_surface, crack_paths, crack_width)
+        elif has_damage:
+            # Post-fragmentation: c_surface only (physical gaps are the cracks)
+            self._apply_damage_visualization(gaussians, c_surface)

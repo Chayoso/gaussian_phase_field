@@ -1241,17 +1241,44 @@ class HybridCrackSimulator:
             self.c_vol, self.x_mpm, x_surf_mpm, self.surface_mask)
         x_surf_world = self.mapper.mpm_to_world(x_surf_mpm)
 
+        # Build debris mask for small fragments (pass to visualizer)
+        debris_mask = None
+        if (self.fragmentation_active
+                and self.fragment_manager is not None
+                and self.fragment_manager.n_fragments > 1):
+            frag_ids = self.fragment_manager.fragment_ids
+            surf_frag_ids = frag_ids[self.surface_mask]
+            debris_mask = torch.zeros(x_surf_world.shape[0],
+                                      dtype=torch.bool, device=x_surf_world.device)
+            for frag_idx in self.fragment_manager.fragment_particle_indices:
+                if (len(frag_idx) == 0
+                        or len(frag_idx) >= self.fragment_manager.min_fragment_particles):
+                    continue
+                frag_label = frag_ids[frag_idx[0]].item()
+                debris_mask |= (surf_frag_ids == frag_label)
+
+        # Polyline visualization is only used when:
+        #  - NOT in burst mode (cracks still forming → individual Gaussian
+        #    perturbations appear as dot artifacts instead of continuous lines)
+        #  - NOT post-fragmentation (physical gaps ARE the cracks; stale
+        #    projection cache causes cross-fragment edge artifacts)
         crack_paths_surface = None
-        if hasattr(self, 'crack_paths') and self.crack_paths:
-            crack_paths_surface = self._project_paths_to_surface(
-                self.crack_paths, x_surf_world)
+        in_burst = (self._gravity_drop and self._gravity_drop_contacted
+                    and hasattr(self, '_impact_frame_count')
+                    and self._impact_frame_count <= 2)
+        if not self.fragmentation_active and not in_burst:
+            if hasattr(self, 'crack_paths') and self.crack_paths:
+                crack_paths_surface = self._project_paths_to_surface(
+                    self.crack_paths, x_surf_world)
+
         crack_width = self.mapper.scale_mpm_to_world(
             self.pf_params.get('crack_width', 0.03))
         self.visualizer.update_gaussians(
             self.gaussians, c_surf, x_surf_world,
             preserve_original=True,
             crack_paths=crack_paths_surface,
-            crack_width=crack_width)
+            crack_width=crack_width,
+            debris_mask=debris_mask)
 
         self._save_diagnostics_if_needed()
 
