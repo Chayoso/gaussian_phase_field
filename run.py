@@ -981,42 +981,59 @@ def run_simulation(config: OmegaConf, simulator, camera, args):
 
 def create_video(frame_dir: Path, output_path: str, fps: int):
     """
-    Create video from saved frames
+    Create H.264 mp4 video from saved frames (VS Code compatible).
 
     Args:
         frame_dir: Directory containing frames
         output_path: Output video path
         fps: Frames per second
     """
-    try:
-        import cv2
-    except ImportError:
-        print("[Warning] OpenCV not available, skipping video creation")
-        return
+    import subprocess
 
     frames = sorted(frame_dir.glob("frame_*.png"))
     if not frames:
         print(f"[Warning] No frames found in {frame_dir}")
         return
 
-    # Read first frame for dimensions
-    first_frame = cv2.imread(str(frames[0]))
-    height, width = first_frame.shape[:2]
+    output_path = str(output_path)
 
-    # Create video writer
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    # Try ffmpeg H.264 (VS Code compatible)
+    try:
+        frame_pattern = str(frame_dir / "frame_%04d.png")
+        cmd = [
+            "ffmpeg", "-y",
+            "-r", str(fps),
+            "-i", frame_pattern,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            "-movflags", "+faststart",
+            output_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode == 0:
+            print(f"[Output] Video created (H.264): {output_path}")
+            return
+        else:
+            print(f"[Warning] ffmpeg failed: {result.stderr[-300:]}")
+    except Exception as e:
+        print(f"[Warning] ffmpeg unavailable: {e}")
 
-    # Write frames
-    for i, frame_path in enumerate(frames):
-        frame = cv2.imread(str(frame_path))
-        out.write(frame)
-
-        if (i + 1) % 100 == 0:
-            print(f"  Processed {i+1}/{len(frames)} frames...")
-
-    out.release()
-    print(f"[Output] Video created: {output_path}")
+    # Fallback: OpenCV mp4v
+    try:
+        import cv2
+        first_frame = cv2.imread(str(frames[0]))
+        height, width = first_frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        for i, frame_path in enumerate(frames):
+            out.write(cv2.imread(str(frame_path)))
+            if (i + 1) % 100 == 0:
+                print(f"  Processed {i+1}/{len(frames)} frames...")
+        out.release()
+        print(f"[Output] Video created (mp4v fallback): {output_path}")
+    except Exception as e:
+        print(f"[Error] Video creation failed: {e}")
 
 
 # ============================================================================
@@ -1248,6 +1265,26 @@ def main():
             print(f"  - Fall distance to ground: {z_min - ground_z:.4f}")
 
             simulator.enable_gravity_drop(ground_z=ground_z)
+
+        elif loading_params.get("type") == "seismic":
+            obj_scale = config.loading.get('object_scale', None)
+            if obj_scale is not None:
+                obj_scale = float(obj_scale)
+                obj_center = list(config.loading.get('object_center', [0.5, 0.5, 0.35]))
+                # Scale around unit-cube center [0.5, 0.5, 0.5], then translate
+                cube_center = torch.tensor([0.5, 0.5, 0.5], device=device,
+                                           dtype=simulator.x_mpm.dtype)
+                simulator.x_mpm = cube_center + (simulator.x_mpm - cube_center) * obj_scale
+                # Shift so object center-of-mass lands on obj_center
+                current_center = simulator.x_mpm.mean(dim=0)
+                target_center = torch.tensor(obj_center, device=device,
+                                             dtype=simulator.x_mpm.dtype)
+                simulator.x_mpm += (target_center - current_center)
+                z_min = simulator.x_mpm[:, 2].min().item()
+                z_max = simulator.x_mpm[:, 2].max().item()
+                print(f"[Seismic] Rescaled object: scale={obj_scale}, center={obj_center}")
+                print(f"  - z range: [{z_min:.4f}, {z_max:.4f}]")
+                print(f"  - Gap to ground: {z_min - float(config.ground_plane.get('point', [0,0,0.05])[2]):.4f}")
 
         # Setup camera
         camera = setup_camera(config)
