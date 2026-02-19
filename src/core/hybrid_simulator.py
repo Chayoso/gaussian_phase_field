@@ -961,43 +961,6 @@ class HybridCrackSimulator:
         return rotated / (rotated.norm() + 1e-8)
 
     @torch.no_grad()
-    def _project_paths_to_surface(self, crack_paths: list, x_surf_world: Tensor) -> list:
-        """Project crack paths onto nearest surface Gaussians (cached, stable)."""
-        if not hasattr(self, '_init_surf_world'):
-            self._init_surf_world = x_surf_world.clone()
-        if not hasattr(self, '_proj_cache'):
-            self._proj_cache = {}
-
-        projected = []
-        for path_idx, path in enumerate(crack_paths):
-            if path.shape[0] < 2:
-                continue
-
-            path_world = self.mapper.mpm_to_world(path)
-            M = path_world.shape[0]
-
-            cache = self._proj_cache.get(path_idx)
-            if cache is not None and cache[0] == M:
-                gauss_idx, unique_mask = cache[1], cache[2]
-            else:
-                gauss_idx = torch.zeros(M, dtype=torch.long, device=path_world.device)
-                for i in range(0, M, 64):
-                    j = min(i + 64, M)
-                    dists = torch.cdist(path_world[i:j], self._init_surf_world)
-                    gauss_idx[i:j] = dists.argmin(dim=1)
-
-                unique_mask = torch.ones(M, dtype=torch.bool, device=path_world.device)
-                for i in range(1, M):
-                    if gauss_idx[i] == gauss_idx[i - 1]:
-                        unique_mask[i] = False
-                self._proj_cache[path_idx] = (M, gauss_idx, unique_mask)
-
-            proj_path = x_surf_world[gauss_idx][unique_mask]
-            if proj_path.shape[0] >= 2:
-                projected.append(proj_path)
-
-        return projected if projected else None
-
     # ================================================================
     # Physics step
     # ================================================================
@@ -1241,7 +1204,7 @@ class HybridCrackSimulator:
             self.c_vol, self.x_mpm, x_surf_mpm, self.surface_mask)
         x_surf_world = self.mapper.mpm_to_world(x_surf_mpm)
 
-        # Build debris mask for small fragments (pass to visualizer)
+        # Build debris mask: small fragments hidden before visualization
         debris_mask = None
         if (self.fragmentation_active
                 and self.fragment_manager is not None
@@ -1257,27 +1220,9 @@ class HybridCrackSimulator:
                 frag_label = frag_ids[frag_idx[0]].item()
                 debris_mask |= (surf_frag_ids == frag_label)
 
-        # Polyline visualization is only used when:
-        #  - NOT in burst mode (cracks still forming → individual Gaussian
-        #    perturbations appear as dot artifacts instead of continuous lines)
-        #  - NOT post-fragmentation (physical gaps ARE the cracks; stale
-        #    projection cache causes cross-fragment edge artifacts)
-        crack_paths_surface = None
-        in_burst = (self._gravity_drop and self._gravity_drop_contacted
-                    and hasattr(self, '_impact_frame_count')
-                    and self._impact_frame_count <= 2)
-        if not self.fragmentation_active and not in_burst:
-            if hasattr(self, 'crack_paths') and self.crack_paths:
-                crack_paths_surface = self._project_paths_to_surface(
-                    self.crack_paths, x_surf_world)
-
-        crack_width = self.mapper.scale_mpm_to_world(
-            self.pf_params.get('crack_width', 0.03))
         self.visualizer.update_gaussians(
             self.gaussians, c_surf, x_surf_world,
             preserve_original=True,
-            crack_paths=crack_paths_surface,
-            crack_width=crack_width,
             debris_mask=debris_mask)
 
         self._save_diagnostics_if_needed()

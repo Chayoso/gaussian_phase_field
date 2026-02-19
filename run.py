@@ -464,18 +464,7 @@ def setup_simulator(
 
     # Visualizer
     visualizer = GaussianCrackVisualizer(
-        crack_color=tuple(config.gaussian_splatting.crack_color),
-        opacity_mode=config.gaussian_splatting.opacity_mode,
-        color_mode=config.gaussian_splatting.color_mode,
-        scale_mode=config.gaussian_splatting.scale_mode,
-        damage_threshold=config.gaussian_splatting.get("damage_threshold", 0.2),
-        sharp_k=config.gaussian_splatting.get("sharp_k", 30.0),
-        edge_width=config.gaussian_splatting.get("edge_width", 0.12),
-        crack_opacity_reduction=config.gaussian_splatting.get("crack_opacity_reduction", 0.85),
-        max_opening=config.gaussian_splatting.get("crack_max_opening", 0.015),
-        gap_fraction=config.gaussian_splatting.get("crack_gap_fraction", 0.3),
-        edge_darken=config.gaussian_splatting.get("crack_edge_darken", 0.3),
-        red_accent=config.gaussian_splatting.get("crack_red_accent", 0.15),
+        damage_threshold=config.gaussian_splatting.get("damage_threshold", 0.3),
         device=device
     )
 
