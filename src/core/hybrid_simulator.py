@@ -997,14 +997,29 @@ class HybridCrackSimulator:
             frames_since = getattr(self, '_impact_frame_count', 0)
             if frames_since < 5:
                 self.mpm.damping = 0.93 + 0.012 * frames_since
+            elif frames_since < 30:
+                # Stronger damping during fragmentation to kill elastic oscillation
+                self.mpm.damping = 0.985 + 0.0005 * (frames_since - 5)  # 0.985 → 0.9975
             else:
-                self.mpm.damping = 0.999
+                self.mpm.damping = 0.998
 
         self._apply_seismic_loading(dt)
 
         stress = self.elasticity(self.F, c=self.c_vol)
         E = torch.exp(self.elasticity.log_E).item() if hasattr(self.elasticity, 'log_E') else 1e6
         stress = stress.clamp(-5.0 * E, 5.0 * E)
+
+        # Fix pudding wobble: zero out ALL stress (including compression) for
+        # high-damage particles at crack boundaries. The constitutive model only
+        # degrades tension; undegraded compression creates elastic restoring
+        # forces that make fragments oscillate like jello.
+        if self.fragmentation_active and self.c_vol is not None:
+            damage_mask = self.c_vol > 0.8
+            if damage_mask.any():
+                # Smooth degradation: linearly scale stress from 1.0 at c=0.8 to 0.0 at c=1.0
+                fade = ((1.0 - self.c_vol[damage_mask]) / 0.2).clamp(0.0, 1.0)
+                stress[damage_mask] *= fade.view(-1, 1, 1)
+
         self._last_stress = stress.detach()
 
         x_old = self.x_mpm.clone()
@@ -1226,6 +1241,21 @@ class HybridCrackSimulator:
             n_frags = self._detect_fragments_from_crack_planes()
             if n_frags > 1:
                 self.fragmentation_active = True
+
+                # Reset C (affine velocity field) and F (deformation gradient)
+                # for high-damage particles at crack boundaries.
+                # These particles have accumulated extreme deformation from the
+                # impact that drives persistent elastic oscillation ("pudding wobble").
+                if self.c_vol is not None:
+                    crack_boundary = self.c_vol > 0.5
+                    if crack_boundary.any():
+                        self.C[crack_boundary] = 0.0
+                        eye = torch.eye(3, device=self.F.device, dtype=self.F.dtype)
+                        self.F[crack_boundary] = eye.unsqueeze(0).expand(
+                            crack_boundary.sum(), -1, -1)
+                        print(f"  [WOBBLE-FIX] Reset C,F for {crack_boundary.sum()} "
+                              f"high-damage particles")
+
                 if hasattr(self, '_impact_center'):
                     ic = self._impact_center.unsqueeze(0)
                     total_particles = sum(len(fi) for fi in self.fragment_manager.fragment_particle_indices)
