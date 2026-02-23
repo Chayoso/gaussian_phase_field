@@ -995,10 +995,10 @@ class HybridCrackSimulator:
         # Simulates fracture energy absorption that geometric cracks don't capture.
         if self._gravity_drop and self._gravity_drop_contacted:
             frames_since = getattr(self, '_impact_frame_count', 0)
-            if frames_since < 8:
-                self.mpm.damping = 0.93 + 0.006 * frames_since
+            if frames_since < 5:
+                self.mpm.damping = 0.93 + 0.012 * frames_since
             else:
-                self.mpm.damping = 0.978
+                self.mpm.damping = 0.999
 
         self._apply_seismic_loading(dt)
 
@@ -1010,17 +1010,53 @@ class HybridCrackSimulator:
         x_old = self.x_mpm.clone()
 
         if self.fragmentation_active and self.fragment_manager.n_fragments > 1:
-            # Per-fragment p2g2p: each fragment gets independent grid physics
-            for frag_idx in self.fragment_manager.fragment_particle_indices:
-                if len(frag_idx) < self.fragment_manager.min_fragment_particles:
-                    self.v_mpm[frag_idx] += dt * self.mpm.gravity.unsqueeze(0)
-                    self.x_mpm[frag_idx] += self.v_mpm[frag_idx] * dt
+            # Rigid body mode: each fragment moves as rigid body (COM velocity + gravity)
+            # This avoids internal stress from p2g2p that prevents separation
+            frames_since_frag = getattr(self, '_impact_frame_count', 0) - 5
+            use_rigid = frames_since_frag >= 3  # first 3 frames use p2g2p, then rigid
+
+            if use_rigid:
+                g = self.mpm.gravity.unsqueeze(0)  # [1, 3]
+                ground_z = 0.05 + self.mpm.clip_bound
+                for frag_idx in self.fragment_manager.fragment_particle_indices:
+                    if len(frag_idx) < 10:
+                        # Debris: simple gravity
+                        self.v_mpm[frag_idx] += dt * g
+                        self.v_mpm[frag_idx] = self.v_mpm[frag_idx].clamp(-5.0, 5.0)
+                        self.x_mpm[frag_idx] += self.v_mpm[frag_idx] * dt
+                        self.x_mpm[frag_idx] = self.x_mpm[frag_idx].clamp(
+                            self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
+                        continue
+                    # Compute COM velocity and apply gravity
+                    v_com = self.v_mpm[frag_idx].mean(dim=0, keepdim=True)
+                    v_com = v_com + dt * g
+                    # Ground collision for COM
+                    x_com = self.x_mpm[frag_idx].mean(dim=0)
+                    z_min_frag = self.x_mpm[frag_idx, 2].min().item()
+                    if z_min_frag <= ground_z and v_com[0, 2] < 0:
+                        v_com[0, 2] *= -0.1  # inelastic bounce
+                    # Move all particles rigidly
+                    self.v_mpm[frag_idx] = v_com.expand(len(frag_idx), -1)
+                    self.x_mpm[frag_idx] += v_com * dt
+                    # Boundary clamping
                     self.x_mpm[frag_idx] = self.x_mpm[frag_idx].clamp(
                         self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
-                    continue
-                self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p_subset(
-                    self.x_mpm, self.v_mpm, self.C, self.F, stress, frag_idx)
-            self.mpm.time += dt
+                self.mpm.time += dt
+            else:
+                # First few frames: use p2g2p for physical response to impulse
+                for frag_idx in self.fragment_manager.fragment_particle_indices:
+                    if len(frag_idx) < self.fragment_manager.min_fragment_particles:
+                        self.v_mpm[frag_idx] += dt * self.mpm.gravity.unsqueeze(0)
+                        debris_v_limit = 5.0
+                        self.v_mpm[frag_idx] = self.v_mpm[frag_idx].clamp(
+                            -debris_v_limit, debris_v_limit)
+                        self.x_mpm[frag_idx] += self.v_mpm[frag_idx] * dt
+                        self.x_mpm[frag_idx] = self.x_mpm[frag_idx].clamp(
+                            self.mpm.clip_bound, 1.0 - self.mpm.clip_bound)
+                        continue
+                    self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p_subset(
+                        self.x_mpm, self.v_mpm, self.C, self.F, stress, frag_idx)
+                self.mpm.time += dt
         else:
             self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p(
                 self.x_mpm, self.v_mpm, self.C, self.F, stress)
@@ -1028,20 +1064,8 @@ class HybridCrackSimulator:
         # Velocity & F clamping
         v_limit = 0.4 * self.mpm.dx / dt
         if self._gravity_drop and self._gravity_drop_contacted:
-            v_limit = min(v_limit, 25.0)
+            v_limit = min(v_limit, 80.0)
         self.v_mpm = self.v_mpm.clamp(-v_limit, v_limit)
-
-        # Suppress elastic rebound after impact.
-        # In brittle fracture KE is absorbed by crack surfaces; our geometric
-        # cracks don't consume KE, so we damp upward velocity explicitly.
-        if self._gravity_drop and self._gravity_drop_contacted:
-            frames_since = getattr(self, '_impact_frame_count', 0)
-            if frames_since < 10:
-                vz = self.v_mpm[:, 2]
-                upward = vz > 0
-                if upward.any():
-                    factor = min(1.0, 0.80 + 0.02 * frames_since)
-                    vz[upward] *= factor
 
         F_limit = 1.5 if (self._gravity_drop and self._gravity_drop_contacted) else 2.0
         self.F = self.F.clamp(-F_limit, F_limit)
@@ -1065,15 +1089,19 @@ class HybridCrackSimulator:
         else:
             self._history_H = torch.maximum(self._history_H, psi)
 
+        # CFL computation (always, for adaptive dt)
+        s_max = stress.abs().max().item()
+        density_eff = self.mpm.p_mass / self.mpm.vol + 1e-12
+        c_wave = (s_max / density_eff) ** 0.5
+        cfl = c_wave * dt / self.mpm.dx if c_wave > 0 else 0
+        self._last_cfl = cfl
+
         # Diagnostics
         step = self._physics_step
         if step < 50 or step % 10 == 0:
             v_max = self.v_mpm.abs().max().item()
             F_min, F_max = self.F.min().item(), self.F.max().item()
-            s_max = stress.abs().max().item()
             disp = (self.x_mpm - x_old).norm(dim=1).max().item()
-            c_wave = (s_max / (self.mpm.p_mass / self.mpm.vol + 1e-12)) ** 0.5
-            cfl = c_wave * dt / self.mpm.dx if c_wave > 0 else 0
             v_mean = self.v_mpm.mean(dim=0)
             KE = 0.5 * (self.v_mpm ** 2).sum().item() * self.mpm.p_mass
             print(f"  [step {step:3d}] |v|={v_max:.4f} F=[{F_min:.4f},{F_max:.4f}] "
@@ -1123,8 +1151,8 @@ class HybridCrackSimulator:
         H_ref = Gc / (2.0 * l0)
 
         dist_from_impact = (self.x_mpm - impact_center.unsqueeze(0)).norm(dim=1)
-        tight_radius = obj_height * 0.12
-        H_tight = torch.exp(-0.5 * (dist_from_impact / tight_radius) ** 2) * (0.6 * H_ref)
+        tight_radius = obj_height * 0.30
+        H_tight = torch.exp(-0.5 * (dist_from_impact / tight_radius) ** 2) * (3.0 * H_ref)
         nuc_frac = self.pf_params.get('nucleation_fraction', 0.3)
         H_tight[H_tight < nuc_frac * H_ref] = 0.0
 
@@ -1139,7 +1167,7 @@ class HybridCrackSimulator:
 
         # Create radial crack seeds
         dev = self.x_mpm.device
-        n_radial = 4
+        n_radial = 8
         if not hasattr(self, 'crack_paths'):
             self.crack_paths = []
             self.crack_dirs = []
@@ -1151,12 +1179,13 @@ class HybridCrackSimulator:
               f"(direction from physics -∇H)")
 
         # Post-impact adjustments
-        post_g = -50.0
+        post_g = -300.0
         g_vec = self.mpm.gravity.clone()
         g_vec[:] = 0.0
         g_vec[2] = post_g
         self.mpm.gravity = g_vec
         self.mpm.damping = 0.975
+        self._post_impact_gravity_restored = False
         print(f"  [POST-IMPACT] gravity→[0,0,{post_g}] damping→0.975")
 
     # ================================================================
@@ -1169,15 +1198,41 @@ class HybridCrackSimulator:
             for _ in range(self.substeps):
                 self.step_crack_only(self.mpm.dt)
         else:
+            # Adaptive dt: subdivide timestep when CFL > threshold
+            dt_base = self.mpm.dt  # original dt from config
+            cfl_target = 0.4       # target CFL ceiling
+            dt_min = dt_base / 8   # minimum dt (max 8x subdivision)
             for _ in range(self.substeps):
-                self.step_physics(self.mpm.dt)
+                dt_current = dt_base
+                # Check if previous step had high CFL → preemptively subdivide
+                last_cfl = getattr(self, '_last_cfl', 0.0)
+                if last_cfl > cfl_target and self._gravity_drop_contacted:
+                    # Scale dt to bring CFL to ~cfl_target
+                    scale = cfl_target / (last_cfl + 1e-8)
+                    dt_current = max(dt_base * scale, dt_min)
+                    n_sub = max(1, int(math.ceil(dt_base / dt_current)))
+                    dt_current = dt_base / n_sub
+                    if n_sub > 1:
+                        if not hasattr(self, '_adaptive_dt_logged') or self._physics_step % 20 == 0:
+                            print(f"  [ADAPTIVE-DT] CFL={last_cfl:.3f} → {n_sub} sub-steps "
+                                  f"(dt={dt_current:.2e})", flush=True)
+                            self._adaptive_dt_logged = True
+                    # Temporarily override mpm.dt and run sub-steps
+                    orig_dt = self.mpm.dt
+                    self.mpm.dt = dt_current
+                    for _s in range(n_sub):
+                        self.step_physics(dt_current)
+                    self.mpm.dt = orig_dt  # restore
+                else:
+                    self.step_physics(dt_current)
 
             # Burst mode at impact for near-instantaneous brittle fracture
             if (self._gravity_drop and self._gravity_drop_contacted and
                     hasattr(self, '_impact_frame_count')):
                 frames_since = self._impact_frame_count
-                if frames_since <= 2:
-                    burst_iters = 30 if frames_since == 0 else (10 if frames_since == 1 else 5)
+                burst_schedule = {0: 40, 1: 20, 2: 10, 3: 8, 4: 5}
+                if frames_since in burst_schedule:
+                    burst_iters = burst_schedule[frames_since]
                     print(f"  [BURST] Impact frame+{frames_since}: "
                           f"running {burst_iters} crack iterations", flush=True)
                     for _ in range(burst_iters):
@@ -1186,17 +1241,48 @@ class HybridCrackSimulator:
                 self.step_hybrid_crack(self.mpm.dt)
         torch.cuda.empty_cache()
 
-        # Fragment detection: trigger once after burst mode completes
+        # Restore gravity gradually after burst mode
+        if (self._gravity_drop and self._gravity_drop_contacted
+                and hasattr(self, '_impact_frame_count')
+                and not getattr(self, '_post_impact_gravity_restored', True)):
+            if self._impact_frame_count >= 10:
+                # Adaptive dt handles CFL, keep full gravity for realistic fall
+                self._post_impact_gravity_restored = True
+                print(f"  [GRAVITY] Maintaining -300.0 (adaptive dt handles CFL)")
+
+        # Fragment detection: trigger after burst mode completes
         if (self.fragment_manager is not None
-                and not self.fragmentation_active
                 and self._gravity_drop and self._gravity_drop_contacted
                 and hasattr(self, '_impact_frame_count')
-                and self._impact_frame_count == 3
+                and self._impact_frame_count in (5, 10, 20, 40)
                 and hasattr(self, 'grid_occupied')
                 and hasattr(self, 'crack_paths') and len(self.crack_paths) > 0):
             n_frags = self._detect_fragments_from_crack_planes()
             if n_frags > 1:
                 self.fragmentation_active = True
+                # Apply separation impulse: push fragments away from impact center
+                # with explicit upward component for dramatic shattering
+                if hasattr(self, '_impact_center'):
+                    ic = self._impact_center.unsqueeze(0)  # [1, 3]
+                    total_particles = sum(len(fi) for fi in self.fragment_manager.fragment_particle_indices)
+                    for frag_idx in self.fragment_manager.fragment_particle_indices:
+                        n_p = len(frag_idx)
+                        if n_p < 10:
+                            continue
+                        com = self.x_mpm[frag_idx].mean(dim=0, keepdim=True)  # [1, 3]
+                        direction = com - ic  # [1, 3]
+                        dist = direction.norm() + 1e-8
+                        direction = direction / dist
+                        # Add upward component (+z) for bounce effect
+                        direction[0, 2] += 0.4
+                        direction = direction / (direction.norm() + 1e-8)
+                        # Scale impulse: larger fragments get more, smaller get less
+                        size_ratio = n_p / (total_particles + 1e-8)
+                        impulse_strength = 4.0 * max(0.3, min(1.0, size_ratio * 5.0))
+                        self.v_mpm[frag_idx] += impulse_strength * direction
+                    print(f"  [SEPARATION] Applied impulse (w/ upward) to {n_frags} fragments")
+
+                # No F reset: keep deformation state intact to avoid "melting" look
 
         # Project damage to surface and update Gaussians
         x_surf_mpm = self.x_mpm[self.surface_mask]

@@ -46,16 +46,16 @@ material:
 phase_field:
   warmup_frames: 1
   dC_max: 0.25
-  crack_tip_speed: 8.0
+  crack_tip_speed: 12.0
   crack_width: 0.004
-  max_total_cracks: 48
+  max_total_cracks: 96
   crack_aniso_ratio: 200.0
-  branch_angle: 25.0
-  branch_min_length: 4
-  branch_probability: 0.50
-  max_branches_per_path: 3
-  nucleation_fraction: 0.35
-  max_nucleation_per_frame: 1
+  branch_angle: 30.0
+  branch_min_length: 3
+  branch_probability: 0.85
+  max_branches_per_path: 4
+  nucleation_fraction: 0.25
+  max_nucleation_per_frame: 3
   nucleation_min_spacing: 10
   fragmentation_enabled: true
   fragment_damage_threshold: 0.5
@@ -117,17 +117,17 @@ rendering:
   image_height: 1920
   background_color: [1.0, 1.0, 1.0]
   camera:
-    distance: 0.85
+    distance: 1.2
     elevation: 25.0
     azimuth: 30.0
     fov: 50.0
-    target: [0.5, 0.5, 0.30]
-  total_frames: 100
+    target: [0.5, 0.5, 0.25]
+  total_frames: 300
   fps: 30
   physics_substeps: 15
 
 output:
-  video_path: "output/gravity_drop_showcase.mp4"
+  video_path: "output/gravity_drop_shatter.mp4"
   frame_dir: "output/frames"
   statistics_log: "output/statistics.csv"
   checkpoint_dir: "output/checkpoints"

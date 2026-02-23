@@ -92,10 +92,10 @@ class GaussianCrackVisualizer:
         gaussians._opacity.data.copy_(self._original_opacity)
         gaussians._scaling.data.copy_(self._original_scaling)
 
-        # Hide debris before crack effects (prevents edge artifacts)
+        # Debris: mild shrinkage + darkening (keep visible)
         if debris_mask is not None and debris_mask.any():
-            gaussians._opacity.data[debris_mask] = -20.0
-            gaussians._scaling.data[debris_mask] -= 5.0
+            gaussians._scaling.data[debris_mask] -= 0.35
+            gaussians._features_dc.data[debris_mask] *= 0.7
 
         # Apply damage visualization
         has_damage = (c_surface is not None
