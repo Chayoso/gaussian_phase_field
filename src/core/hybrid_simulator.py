@@ -997,28 +997,14 @@ class HybridCrackSimulator:
             frames_since = getattr(self, '_impact_frame_count', 0)
             if frames_since < 5:
                 self.mpm.damping = 0.93 + 0.012 * frames_since
-            elif frames_since < 30:
-                # Stronger damping during fragmentation to kill elastic oscillation
-                self.mpm.damping = 0.985 + 0.0005 * (frames_since - 5)  # 0.985 → 0.9975
             else:
-                self.mpm.damping = 0.998
+                self.mpm.damping = 0.999
 
         self._apply_seismic_loading(dt)
 
         stress = self.elasticity(self.F, c=self.c_vol)
         E = torch.exp(self.elasticity.log_E).item() if hasattr(self.elasticity, 'log_E') else 1e6
         stress = stress.clamp(-5.0 * E, 5.0 * E)
-
-        # Fix pudding wobble: zero out ALL stress (including compression) for
-        # high-damage particles at crack boundaries. The constitutive model only
-        # degrades tension; undegraded compression creates elastic restoring
-        # forces that make fragments oscillate like jello.
-        if self.fragmentation_active and self.c_vol is not None:
-            damage_mask = self.c_vol > 0.8
-            if damage_mask.any():
-                # Smooth degradation: linearly scale stress from 1.0 at c=0.8 to 0.0 at c=1.0
-                fade = ((1.0 - self.c_vol[damage_mask]) / 0.2).clamp(0.0, 1.0)
-                stress[damage_mask] *= fade.view(-1, 1, 1)
 
         self._last_stress = stress.detach()
 
@@ -1046,10 +1032,19 @@ class HybridCrackSimulator:
         # Velocity & F clamping
         v_limit = 0.4 * self.mpm.dx / dt
         if self._gravity_drop and self._gravity_drop_contacted:
-            v_limit = min(v_limit, 25.0)
+            v_limit = min(v_limit, 80.0)
         self.v_mpm = self.v_mpm.clamp(-v_limit, v_limit)
 
-        F_limit = 1.5 if (self._gravity_drop and self._gravity_drop_contacted) else 2.0
+        if self._gravity_drop and self._gravity_drop_contacted:
+            # After fragmentation: reduce F_limit to kill wobble source
+            # High F (±1.5) creates permanent stress ~9e6 → endless oscillation
+            # Low F (±1.05) limits stress to ~1e6 → clean separation
+            if getattr(self, 'fragmentation_active', False):
+                F_limit = 1.05
+            else:
+                F_limit = 1.5
+        else:
+            F_limit = 2.0
         self.F = self.F.clamp(-F_limit, F_limit)
 
         # Accumulate tension energy H
@@ -1133,8 +1128,8 @@ class HybridCrackSimulator:
         H_ref = Gc / (2.0 * l0)
 
         dist_from_impact = (self.x_mpm - impact_center.unsqueeze(0)).norm(dim=1)
-        tight_radius = obj_height * 0.12
-        H_tight = torch.exp(-0.5 * (dist_from_impact / tight_radius) ** 2) * (0.6 * H_ref)
+        tight_radius = obj_height * 0.30
+        H_tight = torch.exp(-0.5 * (dist_from_impact / tight_radius) ** 2) * (3.0 * H_ref)
         nuc_frac = self.pf_params.get('nucleation_fraction', 0.3)
         H_tight[H_tight < nuc_frac * H_ref] = 0.0
 
@@ -1149,7 +1144,7 @@ class HybridCrackSimulator:
 
         # Create radial crack seeds
         dev = self.x_mpm.device
-        n_radial = 4
+        n_radial = 8
         if not hasattr(self, 'crack_paths'):
             self.crack_paths = []
             self.crack_dirs = []
@@ -1235,39 +1230,32 @@ class HybridCrackSimulator:
         if (self.fragment_manager is not None
                 and self._gravity_drop and self._gravity_drop_contacted
                 and hasattr(self, '_impact_frame_count')
-                and self._impact_frame_count in (5, 10, 20, 40)
+                and self._impact_frame_count in (2, 5, 10, 20, 40)
                 and hasattr(self, 'grid_occupied')
                 and hasattr(self, 'crack_paths') and len(self.crack_paths) > 0):
             n_frags = self._detect_fragments_from_crack_planes()
             if n_frags > 1:
                 self.fragmentation_active = True
 
-                # Reset C (affine velocity field) and F (deformation gradient)
-                # for high-damage particles at crack boundaries.
-                # These particles have accumulated extreme deformation from the
-                # impact that drives persistent elastic oscillation ("pudding wobble").
-                if self.c_vol is not None:
-                    crack_boundary = self.c_vol > 0.5
-                    if crack_boundary.any():
-                        self.C[crack_boundary] = 0.0
-                        eye = torch.eye(3, device=self.F.device, dtype=self.F.dtype)
-                        self.F[crack_boundary] = eye.unsqueeze(0).expand(
-                            crack_boundary.sum(), -1, -1)
-                        print(f"  [WOBBLE-FIX] Reset C,F for {crack_boundary.sum()} "
-                              f"high-damage particles")
-
                 if hasattr(self, '_impact_center'):
-                    ic = self._impact_center.unsqueeze(0)
+                    ic = self._impact_center.unsqueeze(0)  # [1, 3]
                     total_particles = sum(len(fi) for fi in self.fragment_manager.fragment_particle_indices)
                     for frag_idx in self.fragment_manager.fragment_particle_indices:
                         n_p = len(frag_idx)
-                        if n_p < self.fragment_manager.min_fragment_particles:
+                        if n_p < 10:
                             continue
+                        com = self.x_mpm[frag_idx].mean(dim=0, keepdim=True)
+                        direction = com - ic
+                        dist = direction.norm() + 1e-8
+                        direction = direction / dist
+                        # Add upward component (+z) for bounce effect
+                        direction[0, 2] += 0.6
+                        direction = direction / (direction.norm() + 1e-8)
+                        # Scale impulse inversely with fragment size
                         size_ratio = n_p / (total_particles + 1e-8)
-                        # Upward impulse proportional to fragment size
-                        impulse_up = 2.0 * max(0.3, min(1.0, size_ratio * 5.0))
-                        self.v_mpm[frag_idx, 2] += impulse_up
-                    print(f"  [SEPARATION] Upward impulse 2.0 to {n_frags} fragments")
+                        impulse_strength = 2.0 * max(0.3, min(1.0, size_ratio * 5.0))
+                        self.v_mpm[frag_idx] += impulse_strength * direction
+                    print(f"  [SEPARATION] Applied impulse (w/ upward) to {n_frags} fragments")
 
         # Project damage to surface and update Gaussians
         x_surf_mpm = self.x_mpm[self.surface_mask]
