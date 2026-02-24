@@ -1035,16 +1035,7 @@ class HybridCrackSimulator:
             v_limit = min(v_limit, 80.0)
         self.v_mpm = self.v_mpm.clamp(-v_limit, v_limit)
 
-        if self._gravity_drop and self._gravity_drop_contacted:
-            # After fragmentation: reduce F_limit to kill wobble source
-            # High F (±1.5) creates permanent stress ~9e6 → endless oscillation
-            # Low F (±1.05) limits stress to ~1e6 → clean separation
-            if getattr(self, 'fragmentation_active', False):
-                F_limit = 1.05
-            else:
-                F_limit = 1.5
-        else:
-            F_limit = 2.0
+        F_limit = 1.5 if (self._gravity_drop and self._gravity_drop_contacted) else 2.0
         self.F = self.F.clamp(-F_limit, F_limit)
 
         # Accumulate tension energy H
@@ -1230,7 +1221,7 @@ class HybridCrackSimulator:
         if (self.fragment_manager is not None
                 and self._gravity_drop and self._gravity_drop_contacted
                 and hasattr(self, '_impact_frame_count')
-                and self._impact_frame_count in (2, 5, 10, 20, 40)
+                and self._impact_frame_count in (5, 10, 20, 40)
                 and hasattr(self, 'grid_occupied')
                 and hasattr(self, 'crack_paths') and len(self.crack_paths) > 0):
             n_frags = self._detect_fragments_from_crack_planes()
