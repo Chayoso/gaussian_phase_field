@@ -27,8 +27,13 @@ from src.fracture.graph_builder import GaussianGraph
 from src.fracture.physics_projector import PhysicsProjector
 from src.fracture.crack_front import CrackFront
 from src.fracture.tip_based_fracture_field import GaussianFractureField
+from src.fracture.edge_fracture_field import EdgeFractureField
 from src.fracture.gaussian_splitter import GaussianSplitter
 from src.fracture.graph_fragment_manager import GraphFragmentManager
+from src.fracture.physics_trigger import PhysicsTrigger, FractureTrigger
+from src.fracture.pattern_synthesizer import (
+    PatternSynthesizer, PatternSpec, material_to_pattern_spec
+)
 
 
 class ManifoldSimulator:
@@ -118,34 +123,69 @@ class ManifoldSimulator:
             device=device_str,
         )
 
-        self.fracture_field = GaussianFractureField(
-            Gc=Gc,
-            l0=l0,
-            dC_max=fp.get('dC_max', 0.015),
-            warmup_frames=fp.get('warmup_frames', 5),
-            aniso_ratio=fp.get('aniso_ratio', 3.0),
-            opening_scale=fp.get('opening_scale', 0.02),
-            damage_source_scale=fp.get('damage_source_scale', 0.35),
-            damage_spread=fp.get('damage_spread', 0.18),
-            drive_quantile=fp.get('drive_quantile', 0.90),
-            front_threshold=fp.get('front_threshold', 0.05),
-            radial_bias=fp.get('radial_bias', 2.5),
-            tip_propagation_scale=fp.get('tip_propagation_scale', 0.75),
-            front_substeps=fp.get('front_substeps', 2),
-            tau_init=fp.get('tau_init', 0.30),
-            growth_gain=fp.get('growth_gain', 1.0),
-            band_width=fp.get('band_width', 1.5),
-            band_fill_gain=fp.get('band_fill_gain', 0.30),
-            open_gain=fp.get('open_gain', 1.0),
-            material_family=fp.get('material_family', 'neutral_reference'),
-            enable_front_propagation=fp.get('enable_front_propagation', True),
-            material_drive_floor=fp.get('material_drive_floor', None),
-            diffuse_damage_gain=fp.get('diffuse_damage_gain', 0.16),
-            diffuse_neighborhood_steps=fp.get('diffuse_neighborhood_steps', 2),
-            graph=self.graph,
-            crack_front=crack_front,
-            device=device_str,
-        )
+        # Choose fracture field model:
+        #   "pattern" — physics-conditioned procedural pattern (recommended).
+        #     Physics decides WHEN/WHERE/HOW via trigger + material prior,
+        #     PatternSynthesizer draws the skeleton, EdgeFractureField
+        #     schedules edge breaks, GraphFragmentManager does CC.
+        #   "edge"    — physics-driven bond phase field (exploratory).
+        #   "tip"     — legacy crack-front tip propagation.
+        fracture_model = str(fp.get('fracture_model', 'pattern')).lower()
+        self.fracture_model = fracture_model
+        if fracture_model in ('edge', 'pattern'):
+            self.fracture_field = EdgeFractureField(
+                Gc=Gc,
+                l0=l0,
+                dC_max=fp.get('edge_dC_max', fp.get('dC_max', 0.02)),
+                break_threshold=fp.get('edge_break_threshold', 0.70),
+                warmup_frames=fp.get('warmup_frames', 3),
+                drive_quantile=fp.get('edge_drive_quantile',
+                                      fp.get('drive_quantile', 0.85)),
+                seed_magnitude=fp.get('edge_seed_magnitude', 0.35),
+                seed_H_multiplier=fp.get('edge_seed_H_multiplier', 0.5),
+                drive_scale=fp.get('edge_drive_scale', 5.0),
+                graph=self.graph,
+                device=device_str,
+            )
+            # Pattern-mode machinery (unused in pure edge mode).
+            self.physics_trigger = PhysicsTrigger(
+                stress_threshold=float(fp.get('trigger_stress_threshold', 1e5)),
+                cooldown_frames=int(fp.get('trigger_cooldown_frames', 5)),
+            )
+            self.pattern_synth = PatternSynthesizer(self.graph, device=device_str)
+            # Pattern spec is produced from material_to_pattern_spec() at
+            # trigger time so that CLIP-updated material params can influence it.
+            self._fp_config = dict(fp)  # keep handle for later spec derivation
+            self._active_pattern = None
+        else:
+            self.fracture_field = GaussianFractureField(
+                Gc=Gc,
+                l0=l0,
+                dC_max=fp.get('dC_max', 0.015),
+                warmup_frames=fp.get('warmup_frames', 5),
+                aniso_ratio=fp.get('aniso_ratio', 3.0),
+                opening_scale=fp.get('opening_scale', 0.02),
+                damage_source_scale=fp.get('damage_source_scale', 0.35),
+                damage_spread=fp.get('damage_spread', 0.18),
+                drive_quantile=fp.get('drive_quantile', 0.90),
+                front_threshold=fp.get('front_threshold', 0.05),
+                radial_bias=fp.get('radial_bias', 2.5),
+                tip_propagation_scale=fp.get('tip_propagation_scale', 0.75),
+                front_substeps=fp.get('front_substeps', 2),
+                tau_init=fp.get('tau_init', 0.30),
+                growth_gain=fp.get('growth_gain', 1.0),
+                band_width=fp.get('band_width', 1.5),
+                band_fill_gain=fp.get('band_fill_gain', 0.30),
+                open_gain=fp.get('open_gain', 1.0),
+                material_family=fp.get('material_family', 'neutral_reference'),
+                enable_front_propagation=fp.get('enable_front_propagation', True),
+                material_drive_floor=fp.get('material_drive_floor', None),
+                diffuse_damage_gain=fp.get('diffuse_damage_gain', 0.16),
+                diffuse_neighborhood_steps=fp.get('diffuse_neighborhood_steps', 2),
+                graph=self.graph,
+                crack_front=crack_front,
+                device=device_str,
+            )
 
         self.splitter = GaussianSplitter(
             split_threshold=fp.get('split_threshold', 0.8),
@@ -261,6 +301,15 @@ class ManifoldSimulator:
             fp.get('fragment_physical_downward_bias', 0.32))
         self.fragment_physical_release_frames = max(
             int(fp.get('fragment_physical_release_frames', 20)), 0)
+        # Fragment cohesion: after promote, hard_cut_mask zeros tensile stiffness,
+        # so particles inside a fragment drift apart (visible "flying particles").
+        # Cohesion blends each particle's velocity toward the fragment's COM
+        # velocity every substep, giving semi-rigid behavior without a true
+        # constraint solver.
+        self.fragment_cohesion_alpha = float(
+            fp.get('fragment_cohesion_alpha', 0.35))
+        self.fragment_cohesion_min_size = int(
+            fp.get('fragment_cohesion_min_size', 16))
         self.drive_tension_weight = float(
             fp.get('drive_tension_weight', 1.0))
         self.drive_shear_weight = float(
@@ -680,7 +729,8 @@ class ManifoldSimulator:
 
         # Compute stress with damage degradation
         c_vol = self._get_volumetric_damage()
-        stress = self.elasticity(self.F, c=c_vol)
+        hard_cut_mask = self._get_volumetric_hard_cut_mask()
+        stress = self.elasticity(self.F, c=c_vol, hard_cut_mask=hard_cut_mask)
         E = (torch.exp(self.elasticity.log_E).item()
              if hasattr(self.elasticity, 'log_E') else 1e6)
         stress = stress.clamp(-5.0 * E, 5.0 * E)
@@ -835,6 +885,54 @@ class ManifoldSimulator:
 
         return c_vol
 
+    def _get_volumetric_hard_cut_mask(self) -> Optional[Tensor]:
+        """Project fragment-promoted regions to volumetric particles.
+
+        Returns an (N_mpm,) bool tensor: True where tensile stiffness
+        should be fully zeroed (instead of soft (1-c)^2 degradation).
+        """
+        if self.fragment_manager is None:
+            return None
+        if not self.fragmentation_active:
+            return None
+        c_surf = self.fracture_field.c
+        if c_surf is None:
+            return None
+
+        if self._surface_indices is None:
+            self._surface_indices = torch.where(self.surface_mask)[0]
+
+        n_assign = min(c_surf.shape[0], self._surface_indices.shape[0])
+        if n_assign <= 0:
+            return None
+
+        dev = self.x_mpm.device
+        surf_cut = torch.zeros(n_assign, dtype=torch.bool, device=dev)
+        auth_mask = getattr(self.fragment_manager, "last_authoritative_cut_mask", None)
+        if auth_mask is not None:
+            surf_cut |= auth_mask[:n_assign].bool()
+        support_mask = getattr(self.fragment_manager, "last_support_lost_mask", None)
+        if support_mask is not None:
+            surf_cut |= support_mask[:n_assign].bool()
+        frag_ids = getattr(self.fragment_manager, "fragment_ids", None)
+        if frag_ids is not None:
+            surf_cut |= (frag_ids[:n_assign] > 0)
+        if not bool(surf_cut.any()):
+            return None
+
+        N = self.x_mpm.shape[0]
+        mpm_cut = torch.zeros(N, dtype=torch.bool, device=dev)
+        mpm_cut[self._surface_indices[:n_assign]] = surf_cut
+
+        if (self._interior_indices is not None
+                and self._interior_indices.numel() > 0
+                and self._particle_to_surface_local is not None):
+            mapped = self._particle_to_surface_local[self._interior_indices]
+            valid = (mapped >= 0) & (mapped < n_assign)
+            if bool(valid.any()):
+                mpm_cut[self._interior_indices[valid]] = surf_cut[mapped[valid]]
+        return mpm_cut
+
     def _step_fragmented_physics(self, stress: Tensor, dt: float):
         """Per-fragment MPM physics."""
         # Map Gaussian fragments back to MPM particles
@@ -855,8 +953,38 @@ class ManifoldSimulator:
             self.x_mpm, self.v_mpm, self.C, self.F = self.mpm.p2g2p_subset(
                 self.x_mpm, self.v_mpm, self.C, self.F, stress, frag_idx)
 
+        self._apply_fragment_cohesion(mpm_frag_ids)
         self._apply_physical_fragment_release_drift(mpm_frag_ids, dt)
         self.mpm.time += dt
+
+    @torch.no_grad()
+    def _apply_fragment_cohesion(self, mpm_frag_ids: Tensor) -> None:
+        """Blend each particle's velocity toward its fragment's COM velocity.
+
+        After fragment promotion, tensile stiffness is zeroed via the hard-cut
+        mask, so MPM no longer damps intra-fragment velocity divergence. Without
+        this cohesion step, each particle drifts with its own post-impact
+        velocity and the fragment visually explodes into a particle cloud.
+
+        α=0 disables it (pure MPM). A moderate α (~0.3) keeps fragments
+        visually coherent while still allowing per-particle noise from
+        surface deformation.
+        """
+        alpha = self.fragment_cohesion_alpha
+        if alpha <= 0.0:
+            return
+        if self.fragment_manager is None or self.fragment_manager.n_fragments <= 1:
+            return
+
+        for frag_id in mpm_frag_ids.unique(sorted=True).tolist():
+            if frag_id <= 0:
+                continue
+            mask = mpm_frag_ids == frag_id
+            n = int(mask.sum().item())
+            if n < self.fragment_cohesion_min_size:
+                continue
+            com_v = self.v_mpm[mask].mean(dim=0, keepdim=True)
+            self.v_mpm[mask] = (1.0 - alpha) * self.v_mpm[mask] + alpha * com_v
 
     def _apply_physical_fragment_release_drift(self, mpm_frag_ids: Tensor, dt: float) -> None:
         """Apply a small physical gap / release drift to support-lost fragments."""
@@ -1058,6 +1186,30 @@ class ManifoldSimulator:
         F_gauss = self.physics_projector.project_matrix(
             self.F, self.x_mpm, x_surf_mpm, frame=self.frame_count)
 
+        # --- Pattern mode: trigger + one-shot synthesis ---
+        if self.fracture_model == 'pattern':
+            stress_gauss = None
+            if self._last_stress is not None:
+                stress_gauss = self.physics_projector.project_matrix(
+                    self._last_stress, self.x_mpm, x_surf_mpm,
+                    frame=self.frame_count,
+                )
+            self._maybe_trigger_pattern(
+                positions=x_surf_world,
+                stress_field=stress_gauss,
+                impact_center=impact_center_world,
+            )
+            # Report current simulator frame to the edge field so the
+            # schedule-based break uses the same timebase.
+            self.fracture_field.set_external_frame(self.frame_count)
+            self.fracture_field.update(
+                positions=x_surf_world,
+                init_score=init_score,
+                growth_drive=growth_drive,
+                impact_center=impact_center_world,
+            )
+            return
+
         # Update fracture field
         self.fracture_field.update(
             positions=x_surf_world,
@@ -1067,6 +1219,104 @@ class ManifoldSimulator:
             F_gaussian=F_gauss,
             impact_center=impact_center_world,
         )
+
+    @torch.no_grad()
+    def _maybe_trigger_pattern(
+        self,
+        positions: Tensor,
+        stress_field: Optional[Tensor],
+        impact_center: Optional[Tensor],
+    ) -> None:
+        """Fire the one-shot physics trigger → pattern synthesis when ready."""
+        if self._active_pattern is not None:
+            return  # already triggered
+        if not self._gravity_drop_contacted and self._gravity_drop:
+            return
+
+        trig = None
+        # IMPACT path: wait for the stress wave to develop before firing.
+        # At impact frame 0, stress is compressive / near-zero at contact —
+        # principal σ₁ direction is undefined. A few frames of delay lets
+        # lateral bending and spall tension form, giving a meaningful
+        # stress field to extract direction + magnitude from.
+        if impact_center is not None and self._gravity_drop_contacted:
+            impact_age = getattr(self, "_impact_frame_count", 0)
+            trigger_delay = int(self._fp_config.get("trigger_impact_delay_frames", 6))
+            trigger_window = int(self._fp_config.get("trigger_impact_window_frames", 4))
+            if trigger_delay <= impact_age <= trigger_delay + trigger_window:
+                trig = self.physics_trigger.check_impact(
+                    contact_pos=impact_center,
+                    stress_field=stress_field,
+                    positions=positions,
+                    frame=self.frame_count,
+                )
+        # STRESS path as fallback.
+        if trig is None and stress_field is not None:
+            trig = self.physics_trigger.check_stress_threshold(
+                stress_field=stress_field,
+                positions=positions,
+                frame=self.frame_count,
+            )
+        if trig is None:
+            return
+
+        # Derive pattern spec from material (CLIP-compat) + stress magnitude.
+        mat_cfg = self._fp_config
+        elasticity = self.elasticity
+        E_val = float(torch.exp(elasticity.log_E).item()) if hasattr(elasticity, 'log_E') else 1.5e7
+        Gc_val = float(getattr(elasticity, 'Gc', 60000.0))
+        nu_val = float(elasticity.nu.item()) if hasattr(elasticity, 'nu') else 0.25
+        density_val = float(mat_cfg.get('pattern_density', 1200.0))
+        override = mat_cfg.get('pattern_type_override', None)
+        spec = material_to_pattern_spec(
+            E=E_val, Gc=Gc_val, nu=nu_val, density=density_val,
+            stress_magnitude=trig.stress_magnitude,  # physics-driven density
+            base_density=int(mat_cfg.get('pattern_base_density', 30)),
+            pattern_type_override=override,
+        )
+
+        # Compute per-node σ₁ magnitude on surface Gaussians so the BFS
+        # in pattern synthesis is STRESS-WEIGHTED (rings cluster denser
+        # where tension is concentrated).
+        stress_per_node = None
+        if stress_field is not None:
+            S_sym = 0.5 * (stress_field + stress_field.transpose(1, 2))
+            try:
+                eigenvalues, _ = torch.linalg.eigh(S_sym)
+                stress_per_node = eigenvalues[:, -1].clamp(min=0.0)
+            except Exception:
+                stress_per_node = None
+
+        pattern = self.pattern_synth.generate(
+            positions, trig, spec, stress_per_node=stress_per_node
+        )
+        if pattern is None:
+            print(f"[ManifoldSim-Pattern] trigger fired but pattern was empty "
+                  f"(type={spec.pattern_type})")
+            return
+
+        # Physics diagnostic — how much of "how" is actually physics?
+        pd = trig.principal_dir.cpu().tolist()
+        print(
+            f"[ManifoldSim-Pattern] Triggered at frame {trig.trigger_frame}:\n"
+            f"   WHERE  nuc_idx={trig.nucleation_idx}\n"
+            f"   PHYSICS_DIR  σ₁=({pd[0]:+.3f}, {pd[1]:+.3f}, {pd[2]:+.3f})  "
+            f"|σ₁|={trig.stress_magnitude:.2e}\n"
+            f"   MATERIAL  E={E_val:.2e} Gc={Gc_val:.1f} ν={nu_val:.3f}  "
+            f"brittleness={math.sqrt(E_val/max(Gc_val,1e-9))/math.sqrt(1.5e7/60000):.3f}\n"
+            f"   PATTERN  type={spec.pattern_type} spokes={spec.n_spokes} "
+            f"rings={spec.n_rings} prop={spec.propagation_hops_per_frame:.2f}hops/f\n"
+            f"   EDGES  total={pattern.edge_nodes.numel()} info={pattern.info}"
+        )
+        # Attach schedule to the edge field. Schedule base_frame = current
+        # simulator frame so that a break_frame offset of 0 means "break now".
+        self.fracture_field.attach_pattern(
+            edge_nodes=pattern.edge_nodes,
+            edge_slots=pattern.edge_slots,
+            break_frames=pattern.break_frames,
+            base_frame=self.frame_count,
+        )
+        self._active_pattern = pattern
 
     # ================================================================
     # Fragment detection
@@ -1090,6 +1340,12 @@ class ManifoldSimulator:
                 torch.arange(N, device=self.fracture_field.c.device)
             ]
             return
+
+        # Edge-based / pattern-based fragment detection: use alive_edge CC directly.
+        if getattr(self, 'fracture_model', 'pattern') in ('edge', 'pattern'):
+            self._detect_fragments_edge()
+            return
+
         if self.fracture_field.c.max() < 0.3:
             return
 
@@ -1162,6 +1418,102 @@ class ManifoldSimulator:
                     f"[ManifoldSim] Fragment separation impulse applied "
                     f"(n_frags={n_frags}, broken_edges={self.fragment_manager.last_broken_edges})"
                 )
+
+    @torch.no_grad()
+    def _detect_fragments_edge(self):
+        """Edge-model fragment detection: CC of alive-edge subgraph."""
+        if self.fragment_manager is None or self.fracture_field is None:
+            return
+        ff = self.fracture_field
+        if ff.alive_edge is None:
+            return
+
+        # Skip if nothing broken yet.
+        n_broken = int((~ff.alive_edge).sum().item())
+        if n_broken == 0:
+            return
+
+        min_size = int(self.fracture_cfg.get('min_fragment_particles', 25))
+        info = ff.compute_fragment_labels(min_fragment_size=min_size)
+        fragment_ids = info.get("fragment_ids")
+        n_frags = int(info.get("n_fragments", 1))
+        # Always-on diagnostic: understand the component breakdown.
+        if self.frame_count % 2 == 0:
+            print(
+                f"[ManifoldSim-Edge] frame={self.frame_count} "
+                f"broken={n_broken}/{ff.alive_edge.numel()} "
+                f"raw_cc={info.get('raw_component_count', 0)} "
+                f"top_sizes={info.get('top_component_sizes', [])[:6]} "
+                f"n_frags={n_frags}"
+            )
+
+        # Push into fragment_manager with minimal attrs (simulator downstream
+        # reads fragment_ids, n_fragments, fragment_sizes, fragment_indices).
+        self.fragment_manager.fragment_ids = fragment_ids
+        self.fragment_manager.n_fragments = n_frags
+        self.fragment_manager.fragment_sizes = info.get("fragment_sizes", [])
+        indices_list = []
+        if fragment_ids is not None:
+            for fid in range(n_frags):
+                indices_list.append(torch.where(fragment_ids == fid)[0])
+        self.fragment_manager.fragment_indices = indices_list
+
+        # Zero out legacy masks the simulator queries (keep compatibility).
+        for attr in (
+            "last_authoritative_cut_mask",
+            "last_support_lost_mask",
+            "last_cut_core_mask",
+        ):
+            if hasattr(self.fragment_manager, attr):
+                setattr(self.fragment_manager, attr, None)
+        # Diagnostic counters the simulator also reads.
+        for attr in (
+            "last_broken_edges", "last_total_edges",
+            "last_authoritative_cut_nodes", "last_support_lost_components",
+        ):
+            if hasattr(self.fragment_manager, attr):
+                setattr(self.fragment_manager, attr, 0)
+        if hasattr(self.fragment_manager, "last_top_component_sizes"):
+            self.fragment_manager.last_top_component_sizes = info.get(
+                "top_component_sizes", []
+            )
+
+        if n_frags > 1:
+            if not self.fragmentation_active:
+                self.fragmentation_active = True
+                self._fragment_activation_frame = self.frame_count
+
+                # One-time separation impulse: push detected fragments away
+                # from the impact center, biased upward so they don't just
+                # slide on the ground.
+                if hasattr(self, '_impact_center'):
+                    x_surf_world = self.mapper.mpm_to_world(
+                        self.x_mpm[self.surface_mask])
+                    ic_world = self.mapper.mpm_to_world(
+                        self._impact_center.unsqueeze(0)).squeeze(0)
+                    impulse = self._current_fragment_impulse_strength()
+                    v_surf = torch.zeros_like(x_surf_world)
+                    N_ids = fragment_ids.shape[0]
+                    for fid in range(1, n_frags):
+                        mask = fragment_ids == fid
+                        if int(mask.sum().item()) < 2:
+                            continue
+                        com = x_surf_world[:N_ids][mask].mean(dim=0)
+                        direction = com - ic_world
+                        dist = direction.norm() + 1e-8
+                        direction = direction / dist
+                        direction[2] += float(self.fragment_upward_bias)
+                        direction = direction / (direction.norm() + 1e-8)
+                        v_surf[:N_ids][mask] += impulse * direction
+                    if self._surface_indices is None:
+                        self._surface_indices = torch.where(self.surface_mask)[0]
+                    n_assign = min(N_ids, self._surface_indices.shape[0])
+                    self.v_mpm[self._surface_indices[:n_assign]] += v_surf[:n_assign]
+                    print(
+                        f"[ManifoldSim-Edge] Promoted {n_frags - 1} fragments "
+                        f"(sizes={info.get('fragment_sizes', [])[:10]}, "
+                        f"broken_edges={n_broken})"
+                    )
 
     # ================================================================
     # Gaussian update for rendering

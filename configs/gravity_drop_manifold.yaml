@@ -65,6 +65,24 @@ phase_field:
 
 # Manifold-specific fracture params
 manifold:
+  # --- Fracture model selection ---
+  fracture_model: "pattern"          # "pattern" (physics-conditioned procedural) / "edge" / "tip"
+
+  # --- Pattern fracture params (fracture_model=pattern) ---
+  trigger_stress_threshold: 1e5      # σ_max above which non-impact trigger fires
+  trigger_cooldown_frames: 5         # Min frames between consecutive triggers
+  pattern_density: 1200.0            # Material density (for wave-speed-based timing)
+  pattern_base_density: 60           # Baseline fragment count at reference brittleness
+  pattern_type_override: null        # Force pattern type: null | "voronoi" | "radial_rings" | "none"
+
+  # --- Edge model specific (fracture_model=edge) ---
+  edge_dC_max: 0.035                 # Per-edge max damage increment per frame
+  edge_break_threshold: 0.65         # Edge breaks when c_edge > this
+  edge_drive_quantile: 0.60          # Normalize drive at this quantile
+  edge_seed_magnitude: 0.40          # Peak c_edge seeded at impact
+  edge_seed_H_multiplier: 0.6        # H seed scale at impact (x H_ref)
+  edge_drive_scale: 6.0              # Drive multiplier (higher = harder fracture)
+
   graph_k: 12                        # kNN neighbors for Gaussian graph
   graph_sigma: 0.03                  # Gaussian kernel bandwidth
   graph_rebuild_every: 5             # Rebuild graph every N frames
@@ -162,6 +180,8 @@ manifold:
   fragment_physical_release_velocity: 0.0000 # Physical velocity bias for released fragments
   fragment_physical_downward_bias: 0.32     # Bias released chunks to fall instead of hover
   fragment_physical_release_frames: 20      # Duration of the physical release drift after split
+  fragment_cohesion_alpha: 0.35             # Post-promote velocity cohesion (0=none, 1=rigid). Prevents particle-cloud disintegration.
+  fragment_cohesion_min_size: 16            # Skip cohesion for tiny fragments (let MPM noise handle them)
   drive_tension_weight: 1.00         # Weight of pure tensile energy in fracture drive
   drive_shear_weight: 0.35           # Weight of deviatoric/shear stress in fracture drive
   drive_principal_weight: 0.25       # Weight of principal tensile stress in fracture drive

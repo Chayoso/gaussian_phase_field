@@ -4,11 +4,19 @@ Gaussian Graph Builder
 Constructs and maintains a kNN neighborhood graph over Gaussian positions.
 Used for graph-based fracture propagation, fragment detection, and
 Laplacian-like damage diffusion.
+
+Supports FAISS for fast kNN when available; falls back to chunked torch.cdist.
 """
 
 import torch
 from torch import Tensor
 from typing import Optional, Tuple
+
+try:
+    import faiss
+    _FAISS_AVAILABLE = True
+except Exception:
+    _FAISS_AVAILABLE = False
 
 
 class GaussianGraph:
@@ -28,6 +36,7 @@ class GaussianGraph:
         sigma: float = 0.02,
         rebuild_every: int = 5,
         normal_compat_threshold: float = 0.0,
+        use_faiss: bool = True,
         device: str = "cuda",
     ):
         """
@@ -44,6 +53,7 @@ class GaussianGraph:
         self.sigma = sigma
         self.rebuild_every = rebuild_every
         self.normal_compat_threshold = normal_compat_threshold
+        self.use_faiss = use_faiss and _FAISS_AVAILABLE
         self.device = torch.device(device)
 
         # Graph state
@@ -53,6 +63,7 @@ class GaussianGraph:
         self.N: int = 0
         self._build_count: int = 0
         self._normals: Optional[Tensor] = None    # cached normals
+        self._faiss_index = None                  # persistent FAISS index
 
     def set_normals(self, normals: Tensor) -> None:
         """Store surface normals for normal-aware edge filtering.
@@ -92,8 +103,10 @@ class GaussianGraph:
         k_final = min(self.k, N - 1)
         device = positions.device
 
-        # Compute kNN
-        if N <= 30000:
+        # Compute kNN — FAISS (fast) or torch.cdist (fallback)
+        if self.use_faiss and N > 2000:
+            knn_dist, knn_idx = self._faiss_knn(positions, k_fetch)
+        elif N <= 30000:
             dists = torch.cdist(positions, positions)
             dists.fill_diagonal_(float('inf'))
             knn_dist, knn_idx = dists.topk(k_fetch, largest=False, dim=1)
@@ -166,6 +179,45 @@ class GaussianGraph:
         self.weights = weights
         self.N = N
         self._build_count += 1
+
+    def _faiss_knn(self, positions: Tensor, k_fetch: int) -> Tuple[Tensor, Tensor]:
+        """Fast kNN via FAISS (falls back to GPU FAISS if available).
+
+        Returns (knn_dist, knn_idx) in the same format as torch.cdist+topk.
+        Self-matches are excluded.
+        """
+        N = positions.shape[0]
+        device = positions.device
+        pos_np = positions.detach().cpu().numpy().astype('float32')
+
+        # Prefer GPU FAISS if available and device is CUDA
+        try:
+            if device.type == 'cuda' and hasattr(faiss, 'StandardGpuResources'):
+                res = faiss.StandardGpuResources()
+                idx = faiss.GpuIndexFlatL2(res, 3)
+            else:
+                idx = faiss.IndexFlatL2(3)
+        except Exception:
+            idx = faiss.IndexFlatL2(3)
+
+        idx.add(pos_np)
+        # Fetch k_fetch + 1 because first hit will be the point itself
+        D, I = idx.search(pos_np, k_fetch + 1)  # (N, k+1), (N, k+1)
+        # Drop the self-match (first column) and convert to torch
+        knn_dist_np = D[:, 1:k_fetch + 1]  # squared L2 distances
+        knn_idx_np = I[:, 1:k_fetch + 1].astype('int64')
+        # FAISS returns squared distance; convert to actual distance for
+        # kernel formula consistency with the cdist path.
+        knn_dist_sq = torch.from_numpy(knn_dist_np).to(device)
+        knn_dist = knn_dist_sq.clamp(min=0).sqrt()
+        knn_idx = torch.from_numpy(knn_idx_np).to(device).long()
+        # Handle edge case where FAISS returned fewer than k_fetch neighbors
+        # (only happens for extremely degenerate clouds).
+        if knn_idx.shape[1] < k_fetch:
+            pad = k_fetch - knn_idx.shape[1]
+            knn_idx = torch.cat([knn_idx, knn_idx[:, -1:].expand(-1, pad)], dim=1)
+            knn_dist = torch.cat([knn_dist, knn_dist[:, -1:].expand(-1, pad)], dim=1)
+        return knn_dist, knn_idx
 
     def graph_laplacian(self, values: Tensor) -> Tensor:
         """

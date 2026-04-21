@@ -504,6 +504,7 @@ class CorotatedPhaseFieldElasticity(Elasticity):
         c: Optional[Tensor] = None,
         log_E: Optional[Tensor] = None,
         nu: Optional[Tensor] = None,
+        hard_cut_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Compute Kirchhoff stress with corotated spectral split + damage.
@@ -514,6 +515,10 @@ class CorotatedPhaseFieldElasticity(Elasticity):
             c: (N,) or (N,1) or (N,1,1) damage field [0,1]
             log_E: optional log Young's modulus override
             nu: optional Poisson's ratio override
+            hard_cut_mask: (N,) bool. Where True, tensile stiffness is
+                fully zeroed (g=0) instead of soft (1-c)^2 degradation.
+                Used for particles on promoted-fragment boundaries so
+                fragments truly separate. Compression remains undegraded.
 
         Returns:
             tau: (N, 3, 3) Kirchhoff stress
@@ -556,6 +561,13 @@ class CorotatedPhaseFieldElasticity(Elasticity):
 
         # 7. AT2 degradation: g(c) = (1-c)^2 + k
         g = (1.0 - c).pow(2) + self.k  # (N, 1)
+
+        # 7b. Hard-cut override for promoted fragment cells.
+        if hard_cut_mask is not None:
+            hc = hard_cut_mask.to(device=F.device)
+            if hc.dim() == 1:
+                hc = hc[:, None]
+            g = torch.where(hc.bool(), torch.zeros_like(g), g)
 
         # 8. Combine: degraded tension + undegraded compression
         P_hat = (g * dPsi_plus + dPsi_minus) * sigma  # (N, 3)

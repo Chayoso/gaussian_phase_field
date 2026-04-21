@@ -819,88 +819,92 @@ def main():
                     ),
                     file_prefix="fragment",
                 )
-            if physical_frag_ids is not None and n_frags > 1 and (frame % 10 == 0 or frame == total_frames - 1):
-                physical_positions = simulator.mapper.mpm_to_world(
-                    simulator.x_mpm[simulator.surface_mask]
-                )
-                n_phys = min(
-                    physical_positions.shape[0],
-                    damage.shape[0],
-                    physical_frag_ids.shape[0],
-                )
-                plot_fracture_frame(
-                    physical_positions[:n_phys],
-                    damage[:n_phys],
-                    frame,
-                    out_dir,
-                    file_prefix="physical_crack",
-                    title_extra=(
-                        f"  |  n_frags={n_frags}  cut_edges={cut_edges}"
-                        f"  phys_detach={physical_detached_distance:.4f}"
-                        f"  drop={physical_fragment_drop:.4f}"
-                    ),
-                    visited=(
-                        ff.crack_front.visited_mask[:n_phys]
-                        if hasattr(ff, 'crack_front') and ff.crack_front.visited_mask is not None
-                        else None
-                    ),
-                    tips=(
-                        ff.crack_front.tip_mask[:n_phys]
-                        if hasattr(ff, 'crack_front') and ff.crack_front.tip_mask is not None
-                        else None
-                    ),
-                    fragment_ids=physical_frag_ids[:n_phys],
-                    n_fragments=n_frags,
-                    shard_mask=None,
-                )
-                plot_fragment_frame(
-                    physical_positions[:n_phys],
-                    physical_frag_ids[:n_phys],
-                    frame,
-                    out_dir,
-                    title_extra=(
-                        f"  cut_edges={cut_edges}  phys_detach={physical_detached_distance:.4f}"
-                        f"  drop={physical_fragment_drop:.4f}"
-                    ),
-                    file_prefix="physical_fragment",
-                )
-            plot_opening_frame(
-                render_positions,
-                render_opening,
-                frame,
-                out_dir,
-                title_extra=(
-                    f"  cut_edges={cut_edges}  shell={fragment_shell_contrast:.3f}"
-                    f"  support={support_loss_score_max:.2f}  persist={shard_persistence:.1f}"
-                ),
-            )
-            if simulator.fragment_manager is not None:
-                base_positions = render_positions[:damage.shape[0]]
-                plot_cut_debug_frame(
-                    base_positions,
-                    simulator.graph,
-                    simulator.fragment_manager.last_cut_core_mask,
-                    simulator.fragment_manager.last_cut_edge_mask,
-                    frame,
-                    out_dir,
-                    title_extra=(
-                        f"  cross_breaks={cross_edge_breaks} "
-                        f"detach={detached_distance:.4f}"
-                    ),
-                )
-                if closure_candidate_count > 0 or frame == total_frames - 1:
-                    plot_closure_debug_frame(
-                        base_positions,
-                        simulator.graph,
-                        simulator.fragment_manager.last_closure_candidate_mask,
-                        simulator.fragment_manager.last_closure_boundary_mask,
+            # Extra debug visualizations (physical_crack, physical_fragment,
+            # opening, cut_debug, closure_debug) — disabled by default;
+            # enable via EXTRA_PLOTS=1 env var when investigating.
+            if os.environ.get("EXTRA_PLOTS", "0") == "1":
+                if physical_frag_ids is not None and n_frags > 1 and (frame % 10 == 0 or frame == total_frames - 1):
+                    physical_positions = simulator.mapper.mpm_to_world(
+                        simulator.x_mpm[simulator.surface_mask]
+                    )
+                    n_phys = min(
+                        physical_positions.shape[0],
+                        damage.shape[0],
+                        physical_frag_ids.shape[0],
+                    )
+                    plot_fracture_frame(
+                        physical_positions[:n_phys],
+                        damage[:n_phys],
+                        frame,
+                        out_dir,
+                        file_prefix="physical_crack",
+                        title_extra=(
+                            f"  |  n_frags={n_frags}  cut_edges={cut_edges}"
+                            f"  phys_detach={physical_detached_distance:.4f}"
+                            f"  drop={physical_fragment_drop:.4f}"
+                        ),
+                        visited=(
+                            ff.crack_front.visited_mask[:n_phys]
+                            if hasattr(ff, 'crack_front') and ff.crack_front.visited_mask is not None
+                            else None
+                        ),
+                        tips=(
+                            ff.crack_front.tip_mask[:n_phys]
+                            if hasattr(ff, 'crack_front') and ff.crack_front.tip_mask is not None
+                            else None
+                        ),
+                        fragment_ids=physical_frag_ids[:n_phys],
+                        n_fragments=n_frags,
+                        shard_mask=None,
+                    )
+                    plot_fragment_frame(
+                        physical_positions[:n_phys],
+                        physical_frag_ids[:n_phys],
                         frame,
                         out_dir,
                         title_extra=(
-                            f"  closure_count={closure_candidate_count}"
-                            f"  score={closure_score_max:.2f}"
+                            f"  cut_edges={cut_edges}  phys_detach={physical_detached_distance:.4f}"
+                            f"  drop={physical_fragment_drop:.4f}"
+                        ),
+                        file_prefix="physical_fragment",
+                    )
+                plot_opening_frame(
+                    render_positions,
+                    render_opening,
+                    frame,
+                    out_dir,
+                    title_extra=(
+                        f"  cut_edges={cut_edges}  shell={fragment_shell_contrast:.3f}"
+                        f"  support={support_loss_score_max:.2f}  persist={shard_persistence:.1f}"
+                    ),
+                )
+                if simulator.fragment_manager is not None:
+                    base_positions = render_positions[:damage.shape[0]]
+                    plot_cut_debug_frame(
+                        base_positions,
+                        simulator.graph,
+                        simulator.fragment_manager.last_cut_core_mask,
+                        simulator.fragment_manager.last_cut_edge_mask,
+                        frame,
+                        out_dir,
+                        title_extra=(
+                            f"  cross_breaks={cross_edge_breaks} "
+                            f"detach={detached_distance:.4f}"
                         ),
                     )
+                    if closure_candidate_count > 0 or frame == total_frames - 1:
+                        plot_closure_debug_frame(
+                            base_positions,
+                            simulator.graph,
+                            simulator.fragment_manager.last_closure_candidate_mask,
+                            simulator.fragment_manager.last_closure_boundary_mask,
+                            frame,
+                            out_dir,
+                            title_extra=(
+                                f"  closure_count={closure_candidate_count}"
+                                f"  score={closure_score_max:.2f}"
+                            ),
+                        )
 
         elapsed = time.time() - t0
         c_max = ff.c.max().item() if ff.c is not None else 0
