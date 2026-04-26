@@ -24,6 +24,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.validate_sentence_materials import (  # noqa: E402
     _angular_metrics,
+    _crack_orientation_metrics,
     _flatten_for_csv,
     _front_topology_metrics,
     _runtime_fracture_params,
@@ -352,6 +353,7 @@ def _final_simulator_crack_metrics(
             center = simulator.mapper.mpm_to_world(impact_center.unsqueeze(0)).squeeze(0).detach()
         except Exception:
             center = positions.mean(dim=0)
+    metrics.update(_crack_orientation_metrics(positions, front, center, "final_crack"))
     metrics.update(_angular_metrics(positions, cracked, center, "final_cracked"))
     metrics.update(_angular_metrics(positions, visited, center, "final_visited"))
     if plot_path is not None:
@@ -377,20 +379,20 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
         "",
         "No-render gravity-drop run. CLIP predicts material priors, then the object falls under gravity and reports crack/fragment metrics.",
         "",
-        "| prompt | family | style | top1 | impact | frags max/final | cracked max/final | visited | tips | branch | c_max | cut_edges | open p/n | cat p/n | drop | detach |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| prompt | family | style | top1 | impact | frags max/final | cracked max/final | visited | tips | branch | hoop | c_max | cut_edges | open p/n | cat p/n | drop | detach |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         if row.get("error"):
             lines.append(
-                "| {prompt} | ERROR |  |  |  |  |  |  |  |  |  |  |  |  |  |  |".format(
+                "| {prompt} | ERROR |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |".format(
                     prompt=str(row.get("prompt", ""))[:46],
                 )
             )
             continue
         lines.append(
             "| {prompt} | {family} | {style} | {top1} | {impact} | {maxf}/{finalf} | "
-            "{maxc}/{finalc} | {visited} | {tips} | {branch:.3f} | "
+            "{maxc}/{finalc} | {visited} | {tips} | {branch:.3f} | {hoop:.3f} | "
             "{cmax:.3f} | {cut} | {openp}/{openn} | {catp}/{catn} | {drop:.4f} | {detach:.4f} |".format(
                 prompt=row["prompt"][:46],
                 family=row["family"],
@@ -404,6 +406,7 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
                 visited=row.get("final_visited_count", 0),
                 tips=row.get("final_tip_count", 0),
                 branch=float(row.get("final_branchiness", 0.0)),
+                hoop=float(row.get("final_crack_hoop_fraction", 0.0)),
                 cmax=float(row.get("max_c_max", 0.0)),
                 cut=row.get("max_cut_edges", 0),
                 openp=row.get("max_open_release_patches", 0),

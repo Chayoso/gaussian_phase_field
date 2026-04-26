@@ -147,12 +147,27 @@ class SurfaceCrackDriver:
             phase = 0.45
             ray = (0.5 + 0.5 * torch.cos(ray_count * theta + phase)).clamp(0.0, 1.0)
             ray = ray.pow(2.3)
+            rings = (0.5 + 0.5 * torch.cos(26.0 * r_norm + 0.70)).clamp(0.0, 1.0)
+            rings = rings.pow(2.2)
             near = torch.exp(-0.5 * (planar_r / (0.15 * diag)).pow(2.0))
             far_gain = (0.16 + 0.84 * r_norm).clamp(0.0, 1.0)
             ray_drive = (ray * far_gain + 0.34 * near).clamp(0.0, 1.0)
+            ring_drive = (rings * (0.18 + 0.82 * r_norm)).clamp(0.0, 1.0)
             init_score = torch.maximum(init_score, 0.74 * near * (0.30 + 0.70 * ray))
             growth_drive = torch.maximum(growth_drive, 0.94 * ray_drive)
-            growth_dir = self._safe_normalize(1.70 * radial + 0.18 * upward)
+            growth_drive = torch.maximum(growth_drive, 0.58 * ring_drive)
+            tangent_sign = torch.sign(torch.sin(ray_count * theta + phase))
+            tangent_sign = torch.where(
+                tangent_sign.abs() > 0,
+                tangent_sign,
+                torch.ones_like(tangent_sign),
+            )
+            tangent = tangent * tangent_sign.unsqueeze(1)
+            ray_mix = (0.42 + 0.58 * ray).unsqueeze(1)
+            ring_mix = (rings * (0.18 + 0.82 * r_norm)).unsqueeze(1)
+            growth_dir = self._safe_normalize(
+                1.55 * ray_mix * radial + 0.58 * ring_mix * tangent + 0.18 * upward
+            )
 
         elif style == "spiderweb_branching":
             spoke = (0.5 + 0.5 * torch.cos(9.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
@@ -171,8 +186,8 @@ class SurfaceCrackDriver:
             ring_mix = (0.25 + 0.75 * ring).unsqueeze(1)
             spoke_mix = (0.35 + 0.65 * spoke).unsqueeze(1)
             growth_dir = self._safe_normalize(
-                0.78 * spoke_mix * radial
-                + 0.66 * ring_mix * tangent
+                0.70 * spoke_mix * radial
+                + 0.82 * ring_mix * tangent
                 + 0.18 * upward
             )
 

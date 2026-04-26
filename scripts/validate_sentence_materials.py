@@ -483,6 +483,60 @@ def _front_topology_metrics(crack_front, count: int, device: torch.device) -> di
     }
 
 
+def _crack_orientation_metrics(
+    positions: torch.Tensor,
+    crack_front,
+    center: torch.Tensor,
+    prefix: str,
+) -> dict:
+    zeros = {
+        f"{prefix}_edge_count": 0,
+        f"{prefix}_radial_alignment_mean": 0.0,
+        f"{prefix}_hoop_alignment_mean": 0.0,
+        f"{prefix}_hoop_fraction": 0.0,
+        f"{prefix}_nonradial_fraction": 0.0,
+    }
+    if (
+        crack_front is None
+        or getattr(crack_front, "visited_mask", None) is None
+        or getattr(crack_front, "parent_index", None) is None
+        or positions.numel() == 0
+    ):
+        return zeros
+
+    n = int(positions.shape[0])
+    visited = crack_front.visited_mask[:n]
+    parent = crack_front.parent_index[:n]
+    valid = visited & (parent >= 0) & (parent < n)
+    if not bool(valid.any()):
+        return zeros
+
+    child_idx = torch.where(valid)[0]
+    parent_idx = parent[child_idx].long()
+    edge_xy = positions[child_idx, :2] - positions[parent_idx, :2]
+    rel_xy = positions[child_idx, :2] - center[:2].unsqueeze(0)
+    edge_norm = edge_xy.norm(dim=1)
+    rel_norm = rel_xy.norm(dim=1)
+    good = (edge_norm > 1e-8) & (rel_norm > 1e-8)
+    if not bool(good.any()):
+        return zeros
+
+    edge_xy = edge_xy[good] / edge_norm[good].unsqueeze(1).clamp(min=1e-8)
+    radial = rel_xy[good] / rel_norm[good].unsqueeze(1).clamp(min=1e-8)
+    hoop = torch.stack([-radial[:, 1], radial[:, 0]], dim=1)
+    radial_align = (edge_xy * radial).sum(dim=1).abs().clamp(0.0, 1.0)
+    hoop_align = (edge_xy * hoop).sum(dim=1).abs().clamp(0.0, 1.0)
+    hoop_like = (hoop_align > radial_align) & (hoop_align > 0.55)
+    nonradial = radial_align < 0.82
+    return {
+        f"{prefix}_edge_count": int(radial_align.numel()),
+        f"{prefix}_radial_alignment_mean": float(radial_align.mean().item()),
+        f"{prefix}_hoop_alignment_mean": float(hoop_align.mean().item()),
+        f"{prefix}_hoop_fraction": float(hoop_like.float().mean().item()),
+        f"{prefix}_nonradial_fraction": float(nonradial.float().mean().item()),
+    }
+
+
 @torch.no_grad()
 def simulate_prompt_metrics(
     positions_np: np.ndarray,
@@ -613,6 +667,7 @@ def simulate_prompt_metrics(
         "branchiness": float(tips.sum().item() / max(int(visited.sum().item()), 1)),
     }
     metrics.update(_front_topology_metrics(crack_front, int(c.shape[0]), positions.device))
+    metrics.update(_crack_orientation_metrics(positions, crack_front, seed_center, "crack"))
     metrics.update(_bbox_metrics(positions, cracked, "cracked"))
     metrics.update(_bbox_metrics(positions, visited, "visited"))
     metrics.update(_angular_metrics(positions, cracked, seed_center, "cracked"))

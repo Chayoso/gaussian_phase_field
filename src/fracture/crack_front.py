@@ -29,7 +29,10 @@ class CrackFront:
         tangent_weight: float = 0.16,
         continuity_weight: float = 0.10,
         radial_weight: float = 0.16,
+        hoop_weight: float = 0.0,
+        ring_weight: float = 0.0,
         lift_weight: float = 0.40,
+        overlap_exclusion_weight: float = 0.0,
         max_tip_age: int = 2,
         revisit_drive_threshold: float = 0.8,
         branch_score_ratio: float = 0.97,
@@ -54,7 +57,10 @@ class CrackFront:
         self.tangent_weight = tangent_weight
         self.continuity_weight = continuity_weight
         self.radial_weight = radial_weight
+        self.hoop_weight = hoop_weight
+        self.ring_weight = ring_weight
         self.lift_weight = lift_weight
+        self.overlap_exclusion_weight = overlap_exclusion_weight
         self.max_tip_age = max_tip_age
         self.revisit_drive_threshold = revisit_drive_threshold
         self.branch_score_ratio = branch_score_ratio
@@ -98,6 +104,12 @@ class CrackFront:
                 "closure_min_dist_scale": 0.08,
                 "closure_max_dist_scale": 0.22,
                 "closure_height_scale": 0.10,
+                "hoop_scale": 0.10,
+                "ring_scale": 0.08,
+                "hoop_branch_threshold": 0.70,
+                "hoop_branch_bonus": 0.04,
+                "overlap_penalty_scale": 0.55,
+                "overlap_density_threshold": 0.42,
             }
             if self.crack_style == "radial_shatter":
                 settings.update({
@@ -120,6 +132,12 @@ class CrackFront:
                     "closure_target_cap": 128,
                     "closure_max_dist_scale": 0.32,
                     "closure_height_scale": 0.16,
+                    "hoop_scale": 0.84,
+                    "ring_scale": 0.96,
+                    "hoop_branch_threshold": 0.18,
+                    "hoop_branch_bonus": 0.24,
+                    "overlap_penalty_scale": 0.80,
+                    "overlap_density_threshold": 0.42,
                 })
             elif self.crack_style == "spiderweb_branching":
                 settings.update({
@@ -142,6 +160,12 @@ class CrackFront:
                     "closure_target_cap": 96,
                     "closure_max_dist_scale": 0.36,
                     "closure_height_scale": 0.16,
+                    "hoop_scale": 1.10,
+                    "ring_scale": 1.20,
+                    "hoop_branch_threshold": 0.16,
+                    "hoop_branch_bonus": 0.30,
+                    "overlap_penalty_scale": 0.55,
+                    "overlap_density_threshold": 0.47,
                 })
             elif self.crack_style == "single_smooth":
                 settings.update({
@@ -158,6 +182,12 @@ class CrackFront:
                     "branch_extra_branches": 0,
                     "closure_weight": 0.0,
                     "closure_extra_branches": 0,
+                    "hoop_scale": 0.0,
+                    "ring_scale": 0.0,
+                    "hoop_branch_threshold": 1.0,
+                    "hoop_branch_bonus": 0.0,
+                    "overlap_penalty_scale": 1.15,
+                    "overlap_density_threshold": 0.32,
                 })
             return settings
         if self.material_family == "brittle_moderate":
@@ -183,6 +213,12 @@ class CrackFront:
                 "closure_min_dist_scale": 0.08,
                 "closure_max_dist_scale": 0.28,
                 "closure_height_scale": 0.14,
+                "hoop_scale": 0.35,
+                "ring_scale": 0.32,
+                "hoop_branch_threshold": 0.30,
+                "hoop_branch_bonus": 0.10,
+                "overlap_penalty_scale": 0.65,
+                "overlap_density_threshold": 0.42,
             }
         if self.material_family == "rough_quasi_brittle":
             return {
@@ -207,6 +243,12 @@ class CrackFront:
                 "closure_min_dist_scale": 0.10,
                 "closure_max_dist_scale": 0.40,
                 "closure_height_scale": 0.18,
+                "hoop_scale": 0.24,
+                "ring_scale": 0.20,
+                "hoop_branch_threshold": 0.36,
+                "hoop_branch_bonus": 0.08,
+                "overlap_penalty_scale": 0.35,
+                "overlap_density_threshold": 0.50,
             }
         if self.material_family == "diffuse_damage":
             return {
@@ -231,6 +273,12 @@ class CrackFront:
                 "closure_min_dist_scale": 0.10,
                 "closure_max_dist_scale": 0.20,
                 "closure_height_scale": 0.10,
+                "hoop_scale": 0.0,
+                "ring_scale": 0.0,
+                "hoop_branch_threshold": 1.0,
+                "hoop_branch_bonus": 0.0,
+                "overlap_penalty_scale": 0.0,
+                "overlap_density_threshold": 1.0,
             }
         return {
             "front_enabled": True,
@@ -254,6 +302,12 @@ class CrackFront:
             "closure_min_dist_scale": 0.08,
             "closure_max_dist_scale": 0.30,
             "closure_height_scale": 0.14,
+            "hoop_scale": 0.25,
+            "ring_scale": 0.20,
+            "hoop_branch_threshold": 0.42,
+            "hoop_branch_bonus": 0.08,
+            "overlap_penalty_scale": 0.50,
+            "overlap_density_threshold": 0.44,
         }
 
     def _compute_loop_closure_scores(
@@ -494,11 +548,34 @@ class CrackFront:
                 tangent_gain = self.tangent_weight * (1.0 + self.anisotropy_strength)
                 score = score + tangent_gain * tangent.clamp(0.0, 1.0)
 
+            hoop_score = torch.zeros_like(score)
             if impact_center is not None:
                 radial = positions[nbr_idx] - impact_center.unsqueeze(0)
                 radial = radial / radial.norm(dim=1, keepdim=True).clamp(min=1e-8)
                 radial_gain = self.radial_weight * max(0.35, 1.0 - 0.55 * self.anisotropy_strength)
                 score = score + radial_gain * (edge * radial).sum(dim=1).clamp(min=0.0)
+
+                hoop_gain = self.hoop_weight * float(family_cfg.get("hoop_scale", 0.0))
+                ring_gain = self.ring_weight * float(family_cfg.get("ring_scale", 0.0))
+                if hoop_gain > 0.0 or ring_gain > 0.0:
+                    rel_i = positions[i] - impact_center
+                    planar_i = rel_i[:2]
+                    planar_norm_i = planar_i.norm()
+                    if float(planar_norm_i.item()) > 1e-8:
+                        radial_i = planar_i / planar_norm_i.clamp(min=1e-8)
+                        hoop_dir = torch.zeros(3, device=device, dtype=positions.dtype)
+                        hoop_dir[0] = -radial_i[1]
+                        hoop_dir[1] = radial_i[0]
+                        hoop_align = (edge @ hoop_dir).abs().clamp(0.0, 1.0)
+
+                        rel_n = positions[nbr_idx] - impact_center.unsqueeze(0)
+                        planar_r = rel_n[:, :2].norm(dim=1)
+                        r_norm = (planar_r / max(0.45 * diag, 1e-6)).clamp(0.0, 1.0)
+                        ring_wave = (0.5 + 0.5 * torch.cos(30.0 * r_norm + 0.35))
+                        ring_wave = ring_wave.clamp(0.0, 1.0).pow(2.0)
+                        ring_band = (0.18 + 0.82 * r_norm) * (0.30 + 0.70 * ring_wave)
+                        hoop_score = hoop_align * local_drive * (hoop_gain + ring_gain * ring_band)
+                        score = score + hoop_score
 
                 escape_height = max(float((positions[i, 2] - impact_center[2]).item()), 0.0)
                 escape_gain = 1.0 / (1.0 + 6.0 * escape_height)
@@ -528,6 +605,20 @@ class CrackFront:
                 diag=diag,
                 height_scale=height_scale,
             )
+            overlap_weight = (
+                self.overlap_exclusion_weight
+                * float(family_cfg.get("overlap_penalty_scale", 0.0))
+            )
+            if overlap_weight > 0.0 and self.visited_mask is not None:
+                neighbor_ring = graph.knn_idx[nbr_idx]
+                visited_density = self.visited_mask[neighbor_ring].float().mean(dim=1)
+                density_threshold = float(family_cfg.get("overlap_density_threshold", 0.42))
+                dense = (
+                    (visited_density - density_threshold)
+                    / max(1.0 - density_threshold, 1e-6)
+                ).clamp(0.0, 1.0)
+                closure_relief = (1.0 - 0.65 * closure_score.clamp(0.0, 1.0)).clamp(0.25, 1.0)
+                score = score - overlap_weight * dense * closure_relief * (~allow_revisit).float()
 
             keep = torch.where(score > self.min_successor_score)[0]
             if keep.numel() == 0:
@@ -566,17 +657,25 @@ class CrackFront:
                     (closure_score >= family_cfg["closure_branch_threshold"])
                     & (score >= 0.78 * self.min_successor_score)
                 )[0]
+                hoop_candidates = torch.where(
+                    (hoop_score >= float(family_cfg.get("hoop_branch_threshold", 1.0)))
+                    & (local_drive >= max(0.10, 0.60 * branch_drive_threshold))
+                    & (score >= 0.70 * self.min_successor_score)
+                )[0]
                 candidate_mask = torch.zeros(score.shape[0], dtype=torch.bool, device=device)
                 if branch_candidates.numel() > 0:
                     candidate_mask[branch_candidates] = True
                 if closure_candidates.numel() > 0:
                     candidate_mask[closure_candidates] = True
+                if hoop_candidates.numel() > 0:
+                    candidate_mask[hoop_candidates] = True
                 candidate_idx = torch.where(candidate_mask)[0]
                 if candidate_idx.numel() > 0:
                     extra_aug = (
                         score[candidate_idx]
                         + family_cfg["closure_branch_bonus"] * closure_score[candidate_idx]
                         + 0.75 * family_cfg["lateral_branch_bonus"] * lateral_score[candidate_idx]
+                        + float(family_cfg.get("hoop_branch_bonus", 0.0)) * hoop_score[candidate_idx]
                     )
                     extra_order = extra_aug.argsort(descending=True)
                     extra_pool = candidate_idx[extra_order]
