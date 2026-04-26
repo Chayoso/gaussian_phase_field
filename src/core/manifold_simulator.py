@@ -218,6 +218,11 @@ class ManifoldSimulator:
         ) if frag_enabled else None
         self.fragmentation_active = False
         self.fragment_detect_every = max(int(fp.get('fragment_detect_every', 2)), 1)
+        self.fragment_detect_active_every = max(
+            int(fp.get('fragment_detect_active_every', self.fragment_detect_every)),
+            1,
+        )
+        self._last_fragment_detect_sec = 0.0
         self.fragment_impulse_strength = float(fp.get('fragment_impulse_strength', 2.8))
         self.fragment_upward_bias = float(fp.get('fragment_upward_bias', 0.45))
         self.fragment_visual_offset_scale = float(fp.get('fragment_visual_offset_scale', 0.012))
@@ -665,10 +670,13 @@ class ManifoldSimulator:
         self._step_fracture()
 
         # --- Fragment detection ---
+        fragment_detect_every = self.fragment_detect_every
+        if self.fragmentation_active:
+            fragment_detect_every = max(self.fragment_detect_active_every, 1)
         if (self.fragment_manager is not None
                 and self._gravity_drop_contacted
                 and self.frame_count > 0
-                and self.frame_count % self.fragment_detect_every == 0):
+                and self.frame_count % fragment_detect_every == 0):
             self._detect_fragments()
 
         # --- Update Gaussians for rendering ---
@@ -1334,6 +1342,7 @@ class ManifoldSimulator:
         crack_normal = self.fracture_field.n if self.fracture_field.n is not None else None
         x_surf_world = self.mapper.mpm_to_world(self.x_mpm[self.surface_mask])
         N_surf = min(self.fracture_field.c.shape[0], x_surf_world.shape[0])
+        t0 = time.perf_counter()
         n_frags = self.fragment_manager.detect_fragments(
             self.graph,
             self.fracture_field.c,
@@ -1344,6 +1353,7 @@ class ManifoldSimulator:
             crack_normal=crack_normal,
             crack_tangent=crack_tangent,
         )
+        self._last_fragment_detect_sec = time.perf_counter() - t0
 
         if n_frags > 1:
             self.fracture_field.f = self.fragment_manager.fragment_ids.clone()
@@ -1992,6 +2002,10 @@ class ManifoldSimulator:
                     physical_mean_detached_distance = sum(distances) / max(len(distances), 1)
                     physical_fragment_drop = max(drops) if drops else 0.0
         n_frags_out = max(physical_n_frags, render_n_frags)
+        fragment_timing = (
+            self.fragment_manager.last_timing
+            if self.fragment_manager is not None else {}
+        )
 
         return {
             "frame": self.frame_count,
@@ -2083,6 +2097,43 @@ class ManifoldSimulator:
             "split_gap_visibility": float(render_state.get("split_gap_visibility", 0.0)),
             "fragment_shell_contrast": float(render_state.get("fragment_shell_contrast", 0.0)),
             "shard_persistence": float(render_state.get("shard_persistence", 0.0)),
+            "fragment_detect_sec": float(self._last_fragment_detect_sec),
+            "fragment_detect_total_sec": (
+                float(fragment_timing.get("total_sec", 0.0))
+            ),
+            "fragment_detect_cut_surface_sec": (
+                float(fragment_timing.get("cut_surface_sec", 0.0))
+            ),
+            "fragment_detect_edge_field_sec": (
+                float(fragment_timing.get("edge_field_sec", 0.0))
+            ),
+            "fragment_detect_cc_sec": (
+                float(fragment_timing.get("connected_components_sec", 0.0))
+            ),
+            "fragment_detect_boundary_sec": (
+                float(fragment_timing.get("boundary_stats_sec", 0.0))
+            ),
+            "fragment_detect_closure_sec": (
+                float(fragment_timing.get("closure_scores_sec", 0.0))
+            ),
+            "fragment_detect_component_stats_sec": (
+                float(fragment_timing.get("component_stats_sec", 0.0))
+            ),
+            "fragment_detect_absorb_sec": (
+                float(fragment_timing.get("absorb_neighbors_sec", 0.0))
+            ),
+            "fragment_detect_support_sec": (
+                float(fragment_timing.get("support_loss_sec", 0.0))
+            ),
+            "fragment_detect_remap_sec": (
+                float(fragment_timing.get("remap_sec", 0.0))
+            ),
+            "fragment_detect_release_sec": (
+                float(
+                    fragment_timing.get("explicit_open_release_sec", 0.0)
+                    + fragment_timing.get("catastrophic_release_sec", 0.0)
+                )
+            ),
         }
 
     def save_state(self, path: str):

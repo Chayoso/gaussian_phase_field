@@ -10,6 +10,7 @@ edges with high damage are removed.
 """
 
 import math
+import time
 
 import torch
 from torch import Tensor
@@ -203,6 +204,10 @@ class GraphFragmentManager:
         self.fragment_release_scores: List[float] = []
         self.fragment_support_scores: List[float] = []
         self.fragment_support_lost: List[bool] = []
+        self.last_timing: Dict[str, float] = {}
+
+    def _store_timing(self, timing: Dict[str, float]) -> None:
+        self.last_timing = {key: float(value) for key, value in timing.items()}
 
     def detect_fragments(
         self,
@@ -225,6 +230,16 @@ class GraphFragmentManager:
         Returns:
             n_fragments: number of detected fragments
         """
+        t_start = time.perf_counter()
+        t_stage = t_start
+        timing: Dict[str, float] = {}
+
+        def mark(stage: str) -> None:
+            nonlocal t_stage
+            now = time.perf_counter()
+            timing[stage] = timing.get(stage, 0.0) + (now - t_stage)
+            t_stage = now
+
         if self.material_family == "diffuse_damage":
             N = damage.shape[0]
             self.fragment_ids = torch.zeros(N, dtype=torch.long, device=self.device)
@@ -284,6 +299,8 @@ class GraphFragmentManager:
             self.fragment_release_scores = [0.0]
             self.fragment_support_scores = [1.0]
             self.fragment_support_lost = [False]
+            timing["total_sec"] = time.perf_counter() - t_start
+            self._store_timing(timing)
             return 1
 
         N = damage.shape[0]
@@ -294,6 +311,8 @@ class GraphFragmentManager:
             self.fragment_release_scores = [0.0]
             self.fragment_support_scores = [1.0]
             self.fragment_support_lost = [False]
+            timing["total_sec"] = time.perf_counter() - t_start
+            self._store_timing(timing)
             return 1
 
         if (self.edge_cut_memory is None
@@ -412,6 +431,7 @@ class GraphFragmentManager:
             self.last_authoritative_cut_nodes = int(authoritative_cut_mask.sum().item())
             self.last_authoritative_cut_score_max = float(self.authoritative_cut_memory.max().item())
             self.last_authoritative_cut_mask = authoritative_cut_mask.clone()
+        mark("cut_surface_sec")
 
         seed_d_cut = torch.maximum(c_i, c_j)
         if active_tip_mask is not None:
@@ -478,6 +498,7 @@ class GraphFragmentManager:
         self.last_cut_corridor_edges = self.last_cut_edges
         if raw_cut_edge_mask is not None:
             self.last_cross_edge_breaks = int((((~edge_alive) & raw_cut_edge_mask)).sum().item())
+        mark("edge_field_sec")
 
         # Union-Find on CPU (graph CC is inherently serial)
         knn_idx_cpu = graph.knn_idx.cpu()
@@ -485,6 +506,7 @@ class GraphFragmentManager:
 
         labels = self._union_find_cc(N, knn_idx_cpu, edge_alive_cpu)
         labels = torch.from_numpy(labels).to(self.device)
+        mark("connected_components_sec")
 
         # Remap to contiguous labels and filter small fragments
         unique_labels = labels.unique()
@@ -500,6 +522,7 @@ class GraphFragmentManager:
             effective_cut_damage=effective_cut_damage,
             cut_threshold=cut_break_threshold,
         )
+        mark("boundary_stats_sec")
         boundary_candidate_labels = set()
         boundary_score_by_old = {}
         for old_label, size in zip(unique_labels.tolist(), label_sizes):
@@ -533,6 +556,7 @@ class GraphFragmentManager:
             component_group_map=component_group_map,
             group_ids=candidate_group_ids,
         )
+        mark("closure_scores_sec")
         _, _, closure_debug_threshold = self._closure_params()
         primary_promoted_labels = set()
         fallback_candidate_labels = set()
@@ -571,6 +595,7 @@ class GraphFragmentManager:
                 ),
             )
         )
+        mark("explicit_open_release_sec")
         explicit_patches.extend(
             self._extract_catastrophic_release_patches(
                 positions=positions,
@@ -586,6 +611,7 @@ class GraphFragmentManager:
                 ),
             )
         )
+        mark("catastrophic_release_sec")
         closure_candidate_mask = torch.zeros(N, dtype=torch.bool, device=self.device)
         closure_boundary_mask = torch.zeros_like(corridor_edge_mask)
         closure_candidate_sizes = []
@@ -638,6 +664,7 @@ class GraphFragmentManager:
             broken_edge_mask=~edge_alive,
             edge_damage=effective_cut_damage,
         )
+        mark("component_stats_sec")
         component_group_map, absorbed_count = self._absorb_release_neighbors(
             labels=labels,
             positions=positions,
@@ -647,6 +674,7 @@ class GraphFragmentManager:
             component_stats=component_stats,
             interface_graph=interface_graph,
         )
+        mark("absorb_neighbors_sec")
         self.last_absorbed_components = absorbed_count
         self.last_components_above_primary = len(primary_promoted_labels)
         self.last_components_above_fallback = len(primary_promoted_labels) + len(fallback_candidate_labels)
@@ -686,6 +714,7 @@ class GraphFragmentManager:
                 support_lost_mask = filtered_support_lost_mask
             else:
                 support_lost_mask = torch.zeros_like(support_lost_mask)
+        mark("support_loss_sec")
         grouped_support_lost_labels = set(support_lost_labels)
         grouped_release_scores = {}
         grouped_support_scores = {}
@@ -815,12 +844,15 @@ class GraphFragmentManager:
                 self.detached_node_memory * self.detached_node_decay,
                 current_detached,
             )
+        mark("remap_sec")
 
         if self.n_fragments > 1:
             print(f"[GraphFrag] Detected {self.n_fragments} fragments: "
                   f"sizes={self.fragment_sizes[:10]} "
                   f"promoted={self.last_promoted_components}")
 
+        timing["total_sec"] = time.perf_counter() - t_start
+        self._store_timing(timing)
         return self.n_fragments
 
     def _supports_cut_surface(self) -> bool:

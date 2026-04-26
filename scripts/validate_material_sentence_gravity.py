@@ -261,6 +261,18 @@ def _summarize_history(history: list[dict]) -> dict:
         "max_physical_fragment_drop": max_row("physical_fragment_drop"),
         "max_physical_detached_distance": max_row("physical_detached_distance"),
         "max_detached_distance": max_row("detached_distance"),
+        "max_fragment_detect_sec": max_row("fragment_detect_sec"),
+        "max_fragment_detect_total_sec": max_row("fragment_detect_total_sec"),
+        "max_fragment_detect_cut_surface_sec": max_row("fragment_detect_cut_surface_sec"),
+        "max_fragment_detect_edge_field_sec": max_row("fragment_detect_edge_field_sec"),
+        "max_fragment_detect_cc_sec": max_row("fragment_detect_cc_sec"),
+        "max_fragment_detect_boundary_sec": max_row("fragment_detect_boundary_sec"),
+        "max_fragment_detect_closure_sec": max_row("fragment_detect_closure_sec"),
+        "max_fragment_detect_component_stats_sec": max_row("fragment_detect_component_stats_sec"),
+        "max_fragment_detect_absorb_sec": max_row("fragment_detect_absorb_sec"),
+        "max_fragment_detect_support_sec": max_row("fragment_detect_support_sec"),
+        "max_fragment_detect_remap_sec": max_row("fragment_detect_remap_sec"),
+        "max_fragment_detect_release_sec": max_row("fragment_detect_release_sec"),
         "final_z_min": float(final.get("z_min", 0.0)),
         "final_z_com": float(final.get("z_com", 0.0)),
         "final_v_com_z": float(final.get("v_com_z", 0.0)),
@@ -415,6 +427,35 @@ def _write_gravity_report(rows: list[dict], out_dir: Path) -> None:
                 catn=row.get("max_catastrophic_release_nodes", 0),
                 drop=float(row.get("max_physical_fragment_drop", 0.0)),
                 detach=float(row.get("max_physical_detached_distance", 0.0)),
+            )
+        )
+    lines.append("")
+    lines.extend([
+        "## Fragment Detection Profile",
+        "",
+        "| prompt | style | total s | cut s | edge s | cc s | boundary s | closure s | component s | absorb s | support s | remap s | release s |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ])
+    for row in rows:
+        if row.get("error"):
+            continue
+        lines.append(
+            "| {prompt} | {style} | {total:.3f} | {cut:.3f} | {edge:.3f} | {cc:.3f} | "
+            "{boundary:.3f} | {closure:.3f} | {component:.3f} | {absorb:.3f} | "
+            "{support:.3f} | {remap:.3f} | {release:.3f} |".format(
+                prompt=row["prompt"][:46],
+                style=row.get("sentence_style", "material_default"),
+                total=float(row.get("max_fragment_detect_total_sec", row.get("max_fragment_detect_sec", 0.0))),
+                cut=float(row.get("max_fragment_detect_cut_surface_sec", 0.0)),
+                edge=float(row.get("max_fragment_detect_edge_field_sec", 0.0)),
+                cc=float(row.get("max_fragment_detect_cc_sec", 0.0)),
+                boundary=float(row.get("max_fragment_detect_boundary_sec", 0.0)),
+                closure=float(row.get("max_fragment_detect_closure_sec", 0.0)),
+                component=float(row.get("max_fragment_detect_component_stats_sec", 0.0)),
+                absorb=float(row.get("max_fragment_detect_absorb_sec", 0.0)),
+                support=float(row.get("max_fragment_detect_support_sec", 0.0)),
+                remap=float(row.get("max_fragment_detect_remap_sec", 0.0)),
+                release=float(row.get("max_fragment_detect_release_sec", 0.0)),
             )
         )
     lines.append("")
