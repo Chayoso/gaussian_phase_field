@@ -120,6 +120,7 @@ class ForwardEngine:
             torch.cuda.manual_seed_all(seed)
 
         # Deep-copy config and apply overrides
+        state_callback = kwargs.pop("state_callback", None)
         config = OmegaConf.create(OmegaConf.to_container(self.base_config, resolve=True))
         overrides = {"E": E, "Gc": Gc, "nu": nu, "num_frames": num_frames}
         overrides.update(kwargs)
@@ -177,7 +178,8 @@ class ForwardEngine:
                                 save_frames=save_frames,
                                 return_frames=return_frames,
                                 material_tint=material_tint,
-                                material_props=self._material_props)
+                                material_props=self._material_props,
+                                state_callback=state_callback)
         return frames
 
     def render_from_checkpoint(self, checkpoint_path: str, num_frames: int = 50,
@@ -447,7 +449,8 @@ class ForwardEngine:
     def _run_loop(self, config, simulator, camera,
                   save_frames=False, return_frames=True,
                   start_frame=0, material_tint=None,
-                  material_props=None) -> List[torch.Tensor]:
+                  material_props=None,
+                  state_callback=None) -> List[torch.Tensor]:
         """Execute simulation loop and optionally collect rendered frames."""
         from gaussian_renderer import render
 
@@ -534,6 +537,8 @@ class ForwardEngine:
                 stats["loop_frame"] = int(frame)
                 stats_history.append(stats)
                 self.last_stats_history = stats_history
+                if callable(state_callback):
+                    state_callback(frame, simulator, stats)
 
             # Auto-detect impact frame for checkpointing
             if (hasattr(simulator, '_gravity_drop_contacted')

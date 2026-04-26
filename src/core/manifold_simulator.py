@@ -250,6 +250,12 @@ class ManifoldSimulator:
         self.fragment_render_gap_scale = float(fp.get('fragment_render_gap_scale', 1.55))
         self.fragment_render_velocity_scale = float(fp.get('fragment_render_velocity_scale', 0.22))
         self.fragment_render_min_size = max(int(fp.get('fragment_render_min_size', 6)), 1)
+        self.fragment_render_separation_enabled = bool(
+            fp.get('fragment_render_separation_enabled', False)
+        )
+        self.fragment_render_floor_clamp = bool(
+            fp.get('fragment_render_floor_clamp', True)
+        )
         self.fragment_render_overlap_threshold = float(
             fp.get('fragment_render_overlap_threshold', 0.24)
         )
@@ -374,6 +380,7 @@ class ManifoldSimulator:
                 f"  Fragment detach: detect_every={self.fragment_detect_every}, "
                 f"impulse={self.fragment_impulse_strength:.2f}, "
                 f"visual_offset={self.fragment_visual_offset_scale:.4f}, "
+                f"render_sep={'ON' if self.fragment_render_separation_enabled else 'OFF'}, "
                 f"memory={fp.get('fragment_edge_memory_decay', 0.97):.2f}, "
                 f"hysteresis={fp.get('fragment_component_hysteresis', 0.35):.2f}"
             )
@@ -1140,14 +1147,10 @@ class ManifoldSimulator:
             phase = 0.45
             ray = (0.5 + 0.5 * torch.cos(ray_count * theta + phase)).clamp(0.0, 1.0)
             ray = ray.pow(2.3)
-            rings = (0.5 + 0.5 * torch.cos(26.0 * r_norm + 0.70)).clamp(0.0, 1.0)
-            rings = rings.pow(2.2)
             near = torch.exp(-0.5 * (planar_r / (0.15 * diag)).pow(2.0))
             far_gain = (0.16 + 0.84 * r_norm).clamp(0.0, 1.0)
-            ray_drive = (ray * far_gain + 0.34 * near).clamp(0.0, 1.0)
-            ring_drive = (rings * (0.18 + 0.82 * r_norm)).clamp(0.0, 1.0)
-            growth_drive = torch.maximum(growth_drive, 0.94 * ray_drive)
-            growth_drive = torch.maximum(growth_drive, 0.58 * ring_drive)
+            ray_drive = (0.72 * ray * far_gain + 0.42 * near).clamp(0.0, 1.0)
+            growth_drive = torch.maximum(growth_drive, 0.82 * ray_drive)
             init_score = torch.maximum(init_score, 0.74 * near * (0.30 + 0.70 * ray))
             tangent_sign = torch.sign(torch.sin(ray_count * theta + phase))
             tangent_sign = torch.where(
@@ -1157,16 +1160,14 @@ class ManifoldSimulator:
             )
             tangent = tangent * tangent_sign.unsqueeze(1)
             ray_mix = (0.42 + 0.58 * ray).unsqueeze(1)
-            ring_mix = (rings * (0.18 + 0.82 * r_norm)).unsqueeze(1)
             growth_dir = self._safe_vector_normalize(
-                1.55 * ray_mix * radial + 0.58 * ring_mix * tangent + 0.18 * upward
+                1.45 * ray_mix * radial + 0.16 * ray_mix * tangent + 0.18 * upward
             )
         elif style == "spiderweb_branching":
             ray = (0.5 + 0.5 * torch.cos(9.0 * theta + 0.25)).clamp(0.0, 1.0).pow(2.0)
-            rings = (0.5 + 0.5 * torch.cos(30.0 * r_norm + 0.35)).clamp(0.0, 1.0).pow(2.2)
-            web = torch.maximum(0.88 * ray, 0.82 * rings) * (0.16 + 0.84 * r_norm)
+            spoke = ray * (0.16 + 0.84 * r_norm)
             near = torch.exp(-0.5 * (planar_r / (0.16 * diag)).pow(2.0))
-            growth_drive = torch.maximum(growth_drive, 0.76 * web.clamp(0.0, 1.0))
+            growth_drive = torch.maximum(growth_drive, 0.66 * spoke.clamp(0.0, 1.0) + 0.18 * near)
             init_score = torch.maximum(init_score, 0.48 * near * (0.45 + 0.55 * ray))
             tangent_sign = torch.sign(torch.sin(9.0 * theta + 0.25))
             tangent_sign = torch.where(
@@ -1175,11 +1176,10 @@ class ManifoldSimulator:
                 torch.ones_like(tangent_sign),
             )
             tangent = tangent * tangent_sign.unsqueeze(1)
-            ring_mix = (0.25 + 0.75 * rings).unsqueeze(1)
             ray_mix = (0.35 + 0.65 * ray).unsqueeze(1)
             growth_dir = self._safe_vector_normalize(
-                0.70 * ray_mix * radial
-                + 0.82 * ring_mix * tangent
+                0.92 * ray_mix * radial
+                + 0.22 * ray_mix * tangent
                 + 0.18 * upward
             )
         elif style == "single_smooth":
@@ -1587,6 +1587,12 @@ class ManifoldSimulator:
                 if not bool(mask.any()):
                     continue
                 out[mask] = out[mask] + state["offset"].unsqueeze(0)
+        if self.fragment_render_floor_clamp:
+            floor = float(getattr(self, "_gravity_drop_ground_z", self.mpm.clip_bound))
+            out[:, 2] = torch.maximum(
+                out[:, 2],
+                torch.full_like(out[:, 2], floor),
+            )
         self._advance_render_fragment_states()
         return out, render_ids
 
@@ -1686,7 +1692,11 @@ class ManifoldSimulator:
                     N_gauss = x_final.shape[0]
                     surf_frag = frag_ids[:N_gauss]
 
-        if self.fragmentation_active:
+        if (
+            self.fragmentation_active
+            and self.fragment_render_separation_enabled
+            and self.fragment_visual_offset_scale > 0.0
+        ):
             opening_vis = (
                 self.fracture_field.a if not self._ply_direct else (
                     self.fracture_field.a[self._ply_to_surface]

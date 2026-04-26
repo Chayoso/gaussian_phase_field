@@ -107,6 +107,8 @@ manifold:
   fragment_render_gap_scale: 1.55
   fragment_render_velocity_scale: 0.22
   fragment_render_min_size: 6
+  fragment_render_separation_enabled: false # Debug explode view only; physical positions stay exact by default
+  fragment_render_floor_clamp: true
   fragment_render_overlap_threshold: 0.24
   shard_enable: false
   shard_count_scale: 0.0

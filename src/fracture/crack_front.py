@@ -78,6 +78,7 @@ class CrackFront:
         self.visited_mask: Optional[Tensor] = None
         self.parent_index: Optional[Tensor] = None
         self.tip_age: Optional[Tensor] = None
+        self.path_depth: Optional[Tensor] = None
         self.growth_dir: Optional[Tensor] = None
 
     def _family_settings(self) -> dict:
@@ -93,6 +94,10 @@ class CrackFront:
                 "seed_spacing_scale": 1.25,
                 "lateral_branch_bonus": 0.00,
                 "lateral_branch_threshold": 1.00,
+                "branch_angle_min_deg": 20.0,
+                "branch_angle_max_deg": 60.0,
+                "branch_angle_target_deg": 36.0,
+                "branch_angle_score_threshold": 0.20,
                 "branch_persist_steps": 0,
                 "branch_persist_lateral": 1.00,
                 "branch_extra_branches": 0,
@@ -122,20 +127,28 @@ class CrackFront:
                     "seed_spacing_scale": 0.36,
                     "lateral_branch_bonus": 0.30,
                     "lateral_branch_threshold": 0.14,
+                    "branch_angle_min_deg": 18.0,
+                    "branch_angle_max_deg": 58.0,
+                    "branch_angle_target_deg": 34.0,
+                    "branch_angle_score_threshold": 0.22,
                     "branch_persist_steps": 1,
                     "branch_persist_lateral": 0.22,
-                    "branch_extra_branches": 4,
-                    "closure_weight": 0.16,
-                    "closure_branch_threshold": 0.32,
-                    "closure_branch_bonus": 0.16,
-                    "closure_extra_branches": 2,
+                    "branch_extra_branches": 5,
+                    "closure_weight": 0.08,
+                    "closure_branch_threshold": 0.42,
+                    "closure_branch_bonus": 0.10,
+                    "closure_extra_branches": 1,
                     "closure_target_cap": 128,
                     "closure_max_dist_scale": 0.32,
                     "closure_height_scale": 0.16,
-                    "hoop_scale": 0.84,
-                    "ring_scale": 0.96,
-                    "hoop_branch_threshold": 0.18,
-                    "hoop_branch_bonus": 0.24,
+                    "hoop_scale": 0.58,
+                    "ring_scale": 0.32,
+                    "hoop_branch_threshold": 0.10,
+                    "hoop_branch_bonus": 0.22,
+                    "front_branch_min_depth": 2,
+                    "front_branch_depth_scale": 4.0,
+                    "front_branch_min_progress": 0.14,
+                    "front_branch_outer_progress": 0.86,
                     "overlap_penalty_scale": 0.80,
                     "overlap_density_threshold": 0.42,
                 })
@@ -150,20 +163,28 @@ class CrackFront:
                     "seed_spacing_scale": 0.50,
                     "lateral_branch_bonus": 0.34,
                     "lateral_branch_threshold": 0.16,
+                    "branch_angle_min_deg": 22.0,
+                    "branch_angle_max_deg": 72.0,
+                    "branch_angle_target_deg": 46.0,
+                    "branch_angle_score_threshold": 0.18,
                     "branch_persist_steps": 1,
                     "branch_persist_lateral": 0.24,
-                    "branch_extra_branches": 3,
-                    "closure_weight": 0.34,
-                    "closure_branch_threshold": 0.22,
-                    "closure_branch_bonus": 0.32,
-                    "closure_extra_branches": 3,
+                    "branch_extra_branches": 5,
+                    "closure_weight": 0.16,
+                    "closure_branch_threshold": 0.34,
+                    "closure_branch_bonus": 0.18,
+                    "closure_extra_branches": 1,
                     "closure_target_cap": 96,
                     "closure_max_dist_scale": 0.36,
                     "closure_height_scale": 0.16,
-                    "hoop_scale": 1.10,
-                    "ring_scale": 1.20,
-                    "hoop_branch_threshold": 0.16,
-                    "hoop_branch_bonus": 0.30,
+                    "hoop_scale": 0.78,
+                    "ring_scale": 0.42,
+                    "hoop_branch_threshold": 0.12,
+                    "hoop_branch_bonus": 0.26,
+                    "front_branch_min_depth": 2,
+                    "front_branch_depth_scale": 5.0,
+                    "front_branch_min_progress": 0.12,
+                    "front_branch_outer_progress": 0.90,
                     "overlap_penalty_scale": 0.55,
                     "overlap_density_threshold": 0.47,
                 })
@@ -178,6 +199,7 @@ class CrackFront:
                     "seed_spacing_scale": 1.80,
                     "lateral_branch_bonus": 0.0,
                     "lateral_branch_threshold": 1.0,
+                    "branch_angle_score_threshold": 1.0,
                     "branch_persist_steps": 0,
                     "branch_extra_branches": 0,
                     "closure_weight": 0.0,
@@ -202,6 +224,10 @@ class CrackFront:
                 "seed_spacing_scale": 1.05,
                 "lateral_branch_bonus": 0.12,
                 "lateral_branch_threshold": 0.32,
+                "branch_angle_min_deg": 20.0,
+                "branch_angle_max_deg": 68.0,
+                "branch_angle_target_deg": 42.0,
+                "branch_angle_score_threshold": 0.18,
                 "branch_persist_steps": 0,
                 "branch_persist_lateral": 0.35,
                 "branch_extra_branches": 1,
@@ -232,6 +258,10 @@ class CrackFront:
                 "seed_spacing_scale": 0.85,
                 "lateral_branch_bonus": 0.26,
                 "lateral_branch_threshold": 0.18,
+                "branch_angle_min_deg": 18.0,
+                "branch_angle_max_deg": 78.0,
+                "branch_angle_target_deg": 48.0,
+                "branch_angle_score_threshold": 0.14,
                 "branch_persist_steps": 1,
                 "branch_persist_lateral": 0.22,
                 "branch_extra_branches": 2,
@@ -262,6 +292,7 @@ class CrackFront:
                 "seed_spacing_scale": 1.50,
                 "lateral_branch_bonus": 0.0,
                 "lateral_branch_threshold": 1.0,
+                "branch_angle_score_threshold": 1.0,
                 "branch_persist_steps": 0,
                 "branch_persist_lateral": 1.0,
                 "branch_extra_branches": 0,
@@ -291,6 +322,10 @@ class CrackFront:
             "seed_spacing_scale": 1.0,
             "lateral_branch_bonus": 0.10,
             "lateral_branch_threshold": 0.28,
+            "branch_angle_min_deg": 20.0,
+            "branch_angle_max_deg": 68.0,
+            "branch_angle_target_deg": 42.0,
+            "branch_angle_score_threshold": 0.18,
             "branch_persist_steps": 0,
             "branch_persist_lateral": 0.35,
             "branch_extra_branches": 1,
@@ -309,6 +344,26 @@ class CrackFront:
             "overlap_penalty_scale": 0.50,
             "overlap_density_threshold": 0.44,
         }
+
+    @staticmethod
+    def _branch_angle_score(edge_dir: Tensor, tip_dir: Tensor, family_cfg: dict) -> Tensor:
+        """Score forward-kinked branch candidates, suppressing side bands."""
+        if tip_dir.norm() <= 1e-8:
+            return torch.ones(edge_dir.shape[0], device=edge_dir.device, dtype=edge_dir.dtype)
+
+        min_deg = float(family_cfg.get("branch_angle_min_deg", 20.0))
+        max_deg = float(family_cfg.get("branch_angle_max_deg", 68.0))
+        target_deg = float(family_cfg.get("branch_angle_target_deg", 42.0))
+        if max_deg <= min_deg:
+            return torch.zeros(edge_dir.shape[0], device=edge_dir.device, dtype=edge_dir.dtype)
+
+        target_deg = min(max(target_deg, min_deg), max_deg)
+        forward_cos = (edge_dir @ tip_dir).clamp(-0.9999, 0.9999)
+        angle_deg = torch.rad2deg(torch.acos(forward_cos))
+        in_window = ((angle_deg >= min_deg) & (angle_deg <= max_deg)).to(edge_dir.dtype)
+        falloff = max(target_deg - min_deg, max_deg - target_deg, 1e-6)
+        centered = (1.0 - (angle_deg - target_deg).abs() / falloff).clamp(0.0, 1.0)
+        return in_window * (0.35 + 0.65 * centered)
 
     def _compute_loop_closure_scores(
         self,
@@ -381,6 +436,7 @@ class CrackFront:
         self.visited_mask = torch.zeros(N, dtype=torch.bool, device=device)
         self.parent_index = torch.full((N,), -1, dtype=torch.long, device=device)
         self.tip_age = torch.zeros(N, dtype=torch.long, device=device)
+        self.path_depth = torch.zeros(N, dtype=torch.long, device=device)
         self.growth_dir = torch.zeros(N, 3, device=device)
 
     def has_active_tips(self) -> bool:
@@ -448,6 +504,9 @@ class CrackFront:
         self.tip_mask[sel_t] = True
         self.visited_mask[sel_t] = True
         self.tip_age[sel_t] = 0
+        if self.path_depth is None or self.path_depth.shape[0] != positions.shape[0]:
+            self.path_depth = torch.zeros_like(self.tip_age)
+        self.path_depth[sel_t] = 0
 
         seed_dir = growth_dir_hint[sel_t]
         seed_dir_norm = seed_dir.norm(dim=1, keepdim=True)
@@ -476,6 +535,8 @@ class CrackFront:
 
         device = positions.device
         normals = getattr(graph, "_normals", None)
+        if self.path_depth is None or self.path_depth.shape[0] != positions.shape[0]:
+            self.path_depth = torch.zeros_like(self.tip_age)
         tip_indices = torch.where(self.tip_mask)[0]
         bbox_extent = positions.max(dim=0).values - positions.min(dim=0).values
         diag = float(bbox_extent.norm().item())
@@ -491,6 +552,7 @@ class CrackFront:
         next_tip_mask = torch.zeros_like(self.tip_mask)
         next_growth_dir = torch.zeros_like(self.growth_dir)
         next_tip_age = torch.zeros_like(self.tip_age)
+        next_path_depth = torch.zeros_like(self.path_depth)
         new_count = 0
 
         for tip_idx in tip_indices.tolist():
@@ -549,6 +611,7 @@ class CrackFront:
                 score = score + tangent_gain * tangent.clamp(0.0, 1.0)
 
             hoop_score = torch.zeros_like(score)
+            front_branch_gate = torch.ones_like(score)
             if impact_center is not None:
                 radial = positions[nbr_idx] - impact_center.unsqueeze(0)
                 radial = radial / radial.norm(dim=1, keepdim=True).clamp(min=1e-8)
@@ -563,18 +626,41 @@ class CrackFront:
                     planar_norm_i = planar_i.norm()
                     if float(planar_norm_i.item()) > 1e-8:
                         radial_i = planar_i / planar_norm_i.clamp(min=1e-8)
+                        radial_i3 = torch.zeros(3, device=device, dtype=positions.dtype)
+                        radial_i3[0] = radial_i[0]
+                        radial_i3[1] = radial_i[1]
                         hoop_dir = torch.zeros(3, device=device, dtype=positions.dtype)
                         hoop_dir[0] = -radial_i[1]
                         hoop_dir[1] = radial_i[0]
                         hoop_align = (edge @ hoop_dir).abs().clamp(0.0, 1.0)
 
-                        rel_n = positions[nbr_idx] - impact_center.unsqueeze(0)
-                        planar_r = rel_n[:, :2].norm(dim=1)
-                        r_norm = (planar_r / max(0.45 * diag, 1e-6)).clamp(0.0, 1.0)
-                        ring_wave = (0.5 + 0.5 * torch.cos(30.0 * r_norm + 0.35))
-                        ring_wave = ring_wave.clamp(0.0, 1.0).pow(2.0)
-                        ring_band = (0.18 + 0.82 * r_norm) * (0.30 + 0.70 * ring_wave)
-                        hoop_score = hoop_align * local_drive * (hoop_gain + ring_gain * ring_band)
+                        r_norm_i = (planar_norm_i / max(0.45 * diag, 1e-6)).clamp(0.0, 1.0)
+                        min_progress = float(family_cfg.get("front_branch_min_progress", 0.12))
+                        outer_progress = float(family_cfg.get("front_branch_outer_progress", 0.90))
+                        start_gate = (
+                            (r_norm_i - min_progress) / max(0.18, 1e-6)
+                        ).clamp(0.0, 1.0)
+                        outer_gate = (
+                            (outer_progress - r_norm_i) / max(0.14, 1e-6)
+                        ).clamp(0.0, 1.0)
+                        depth_i = int(self.path_depth[i].item())
+                        min_depth = int(family_cfg.get("front_branch_min_depth", 2))
+                        depth_scale = max(float(family_cfg.get("front_branch_depth_scale", 4.0)), 1.0)
+                        depth_gate = torch.tensor(
+                            max(0.0, min(1.0, (depth_i + 1 - min_depth) / depth_scale)),
+                            device=device,
+                            dtype=positions.dtype,
+                        )
+                        radial_alignment = (tip_dir @ radial_i3).clamp(min=0.0, max=1.0)
+                        branch_gate = (
+                            start_gate
+                            * outer_gate
+                            * depth_gate
+                            * (0.35 + 0.65 * radial_alignment)
+                        ).clamp(0.0, 1.0)
+                        front_branch_gate = torch.full_like(score, float(branch_gate.item()))
+                        local_hoop_gain = hoop_gain + 0.65 * ring_gain
+                        hoop_score = hoop_align * local_drive * branch_gate * local_hoop_gain
                         score = score + hoop_score
 
                 escape_height = max(float((positions[i, 2] - impact_center[2]).item()), 0.0)
@@ -592,9 +678,20 @@ class CrackFront:
             score = score - 0.5 * self.tip_mask[nbr_idx].float()
             if tip_dir.norm() > 1e-8:
                 lateral_score = (1.0 - (edge @ tip_dir).abs()).clamp(0.0, 1.0)
+                branch_angle_score = self._branch_angle_score(edge, tip_dir, family_cfg)
             else:
                 lateral_score = torch.zeros(edge.shape[0], device=device, dtype=positions.dtype)
-            score = score + family_cfg["lateral_branch_bonus"] * lateral_score * local_drive
+                branch_angle_score = torch.zeros(edge.shape[0], device=device, dtype=positions.dtype)
+            style_gates_lateral = self.crack_style in {"radial_shatter", "spiderweb_branching"}
+            lateral_gate = front_branch_gate if style_gates_lateral else torch.ones_like(front_branch_gate)
+            score = (
+                score
+                + family_cfg["lateral_branch_bonus"]
+                * lateral_score
+                * branch_angle_score
+                * local_drive
+                * lateral_gate
+            )
             closure_score = self._compute_loop_closure_scores(
                 tip_index=i,
                 neighbor_idx=nbr_idx,
@@ -626,6 +723,7 @@ class CrackFront:
                     next_tip_mask[i] = True
                     next_growth_dir[i] = tip_dir if tip_dir.norm() > 1e-8 else torch.zeros(3, device=device)
                     next_tip_age[i] = self.tip_age[i] + 1
+                    next_path_depth[i] = self.path_depth[i]
                 continue
 
             keep_score = score[keep]
@@ -644,21 +742,32 @@ class CrackFront:
                     and second_drive >= branch_drive_threshold
                 ):
                     branch_topk = min(successor_cap, keep.numel())
-            keep = keep[:branch_topk]
+            if branch_topk > 1:
+                angle_threshold = float(family_cfg.get("branch_angle_score_threshold", 0.18))
+                primary = keep[:1]
+                branch_keep = keep[1:][branch_angle_score[keep[1:]] >= angle_threshold]
+                keep = torch.cat([primary, branch_keep[: branch_topk - 1]], dim=0)
+            else:
+                keep = keep[:1]
             extra_budget = int(family_cfg["branch_extra_branches"]) + int(family_cfg["closure_extra_branches"])
             if keep.numel() > 0 and keep.numel() < successor_cap and can_branch and extra_budget > 0:
                 extra_pool = keep.new_tensor([], dtype=keep.dtype)
+                angle_threshold = float(family_cfg.get("branch_angle_score_threshold", 0.18))
                 branch_candidates = torch.where(
                     (lateral_score >= family_cfg["lateral_branch_threshold"])
+                    & (branch_angle_score >= angle_threshold)
+                    & (lateral_gate >= 0.10)
                     & (local_drive >= max(0.10, 0.65 * branch_drive_threshold))
                     & (score >= 0.72 * self.min_successor_score)
                 )[0]
                 closure_candidates = torch.where(
                     (closure_score >= family_cfg["closure_branch_threshold"])
+                    & (branch_angle_score >= angle_threshold)
                     & (score >= 0.78 * self.min_successor_score)
                 )[0]
                 hoop_candidates = torch.where(
                     (hoop_score >= float(family_cfg.get("hoop_branch_threshold", 1.0)))
+                    & (branch_angle_score >= angle_threshold)
                     & (local_drive >= max(0.10, 0.60 * branch_drive_threshold))
                     & (score >= 0.70 * self.min_successor_score)
                 )[0]
@@ -674,7 +783,10 @@ class CrackFront:
                     extra_aug = (
                         score[candidate_idx]
                         + family_cfg["closure_branch_bonus"] * closure_score[candidate_idx]
-                        + 0.75 * family_cfg["lateral_branch_bonus"] * lateral_score[candidate_idx]
+                        + 0.75
+                        * family_cfg["lateral_branch_bonus"]
+                        * lateral_score[candidate_idx]
+                        * branch_angle_score[candidate_idx]
                         + float(family_cfg.get("hoop_branch_bonus", 0.0)) * hoop_score[candidate_idx]
                     )
                     extra_order = extra_aug.argsort(descending=True)
@@ -698,6 +810,7 @@ class CrackFront:
                 self.parent_index[j] = i
                 self.visited_mask[j] = True
                 next_tip_age[j] = 0
+                next_path_depth[j] = self.path_depth[i] + 1
                 grow_vec = edge[keep[local_k]]
                 hint_vec = growth_dir_hint[j]
                 mix = 0.65 * grow_vec + 0.35 * hint_vec
@@ -715,10 +828,12 @@ class CrackFront:
                     next_tip_mask[i] = True
                     next_growth_dir[i] = tip_dir if tip_dir.norm() > 1e-8 else torch.zeros(3, device=device)
                     next_tip_age[i] = self.tip_age[i] + 1
+                    next_path_depth[i] = self.path_depth[i]
 
         self.tip_mask = next_tip_mask
         self.growth_dir = next_growth_dir
         self.tip_age = next_tip_age
+        self.path_depth = next_path_depth
         self.visited_mask |= next_tip_mask
         return new_count
 
@@ -728,6 +843,7 @@ class CrackFront:
             "visited_mask": self.visited_mask,
             "parent_index": self.parent_index,
             "tip_age": self.tip_age,
+            "path_depth": self.path_depth,
             "growth_dir": self.growth_dir,
         }
 
@@ -736,4 +852,5 @@ class CrackFront:
         self.visited_mask = state["visited_mask"]
         self.parent_index = state["parent_index"]
         self.tip_age = state["tip_age"]
+        self.path_depth = state.get("path_depth", torch.zeros_like(self.tip_age))
         self.growth_dir = state["growth_dir"]
