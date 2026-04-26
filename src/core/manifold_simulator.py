@@ -715,6 +715,7 @@ class ManifoldSimulator:
 
             if z_min <= self._gravity_drop_ground_z + 0.01:
                 self._handle_ground_impact()
+                self._enforce_ground_contact_constraint()
 
             self._physics_step += 1
             return
@@ -767,12 +768,32 @@ class ManifoldSimulator:
             scale = 10.0 / v_mag[too_fast].clamp(min=1e-8)
             self.v_mpm[too_fast] *= scale.unsqueeze(-1)
 
+        self._enforce_ground_contact_constraint()
+
         step = self._physics_step
         if step < 50 or step % 10 == 0:
             print(f"  [phys {step:3d}] |v|={self.v_mpm.abs().max():.4f} "
                   f"|stress|={s_max:.2e} CFL~{self._last_cfl:.3f}")
 
         self._physics_step += 1
+
+    def _enforce_ground_contact_constraint(self) -> None:
+        """Keep physical particles on or above the gravity-drop floor."""
+        if not (self._gravity_drop and self._gravity_drop_contacted):
+            return
+        if self.x_mpm is None:
+            return
+
+        floor = float(self._gravity_drop_ground_z)
+        below = self.x_mpm[:, 2] < floor
+        if not bool(below.any()):
+            return
+
+        self.x_mpm[below, 2] = floor
+        if self.v_mpm is not None:
+            downward = below & (self.v_mpm[:, 2] < 0.0)
+            if bool(downward.any()):
+                self.v_mpm[downward, 2] = 0.0
 
     def _get_volumetric_damage(self) -> Tensor:
         """
